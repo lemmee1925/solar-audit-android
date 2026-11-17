@@ -11,6 +11,8 @@ export type PhotoItem = {
   longitude?: number | null;
   accuracy?: number | null;
   capturedAt?: string | null;
+  uploaded?: boolean;
+  uploadedRemark?: string;
 };
 
 export function normalizePhotoEntry(entry: unknown): PhotoItem | null {
@@ -32,6 +34,8 @@ export function normalizePhotoEntry(entry: unknown): PhotoItem | null {
       longitude: lon,
       accuracy: acc,
       capturedAt: obj.capturedAt != null ? String(obj.capturedAt) : null,
+      uploaded: obj.uploaded === true,
+      uploadedRemark: obj.uploadedRemark != null ? String(obj.uploadedRemark) : undefined,
     };
   }
   return null;

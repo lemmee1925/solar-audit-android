@@ -1278,7 +1278,13 @@ export default function App() {
       setExecutionEquipment((current) => current.map((eq) => eq.id === equipmentId
         ? { ...eq, checkpoints: eq.checkpoints.map((cp) => cp.id === checkpoint.id ? updated : cp) }
         : eq));
-      setMessage(`${incoming.length} photo${incoming.length === 1 ? "" : "s"} saved${location ? ` with GPS (${location.latitude.toFixed(5)}, ${location.longitude.toFixed(5)})` : " on this device"}.`);
+      const onlineReady = Boolean(serverToken && (typeof navigator === "undefined" || navigator.onLine));
+      setMessage(
+        `${incoming.length} photo${incoming.length === 1 ? "" : "s"} saved${location ? ` with GPS (${location.latitude.toFixed(5)}, ${location.longitude.toFixed(5)})` : " on this device"}${onlineReady ? " — syncing in background…" : " (will sync when online)."}`,
+      );
+      if (onlineReady) {
+        void tryImmediateCheckpointPhotoUpload(activeAudit, equipmentId, checkpoint.id);
+      }
     } catch (error) {
       console.error("[Solar Audit] Photo capture/save failed:", error);
       setMessage("Photo could not be saved. Please try again with a smaller photo.");
@@ -1752,6 +1758,158 @@ export default function App() {
 
   const normalizeMappingText = (value: unknown) => String(value ?? "").trim().replace(/\s+/g, " ").toLocaleLowerCase();
 
+  function buildDeterministicPhotoId(auditId: string, checkpointId: string, refOrDataUrl: string): string {
+    const seed = `${auditId}:${checkpointId}:${refOrDataUrl}`;
+    const hash32 = (input: string, salt: number) => {
+      let hash = (2166136261 ^ salt) >>> 0;
+      for (let i = 0; i < input.length; i++) hash = Math.imul(hash ^ input.charCodeAt(i), 16777619) >>> 0;
+      return hash.toString(16).padStart(8, "0");
+    };
+    const raw = `${hash32(seed, 0)}${hash32(seed, 0x9e3779b9)}${hash32(seed, 0x85ebca6b)}${hash32(seed, 0xc2b2ae35)}`.split("");
+    raw[12] = "4";
+    raw[16] = ((parseInt(raw[16], 16) & 0x3) | 0x8).toString(16);
+    const hex = raw.join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+  }
+
+  function buildAuditManifestData(
+    audit: LocalAudit,
+    ref: any,
+    execution: AuditEquipment[],
+    existingObservations: LocalObservation[],
+  ): {
+    payload: AuditManifestPayload;
+    photoQueue: Array<{ checkpointId: string; photoIndex: number; photo: PhotoItem; questionId: number; assetRef: string }>;
+  } {
+    const localPlantName =
+      audit.plantName ||
+      current.plants.find((p) => p.id === audit.plantId)?.name ||
+      "(unknown local plant)";
+    const localPlant = current.plants.find((p) => p.id === audit.plantId);
+    const exactServerIdMatch = localPlant?.serverPlantId
+      ? ref.plants.find((p: any) => String(p.id) === String(localPlant.serverPlantId))
+      : undefined;
+    const exactNameMatch = localPlant?.serverPlantId
+      ? undefined
+      : ref.plants.find((p: any) => normalizeMappingText(p.name) === normalizeMappingText(localPlantName));
+    const serverPlant = exactServerIdMatch || exactNameMatch;
+    if (!serverPlant) {
+      const serverPlantNames = ref.plants.map((p: any) => `${p.name} [ID: ${p.id}]`).join("\n");
+      throw new Error(
+        `Plant mapping failed.\nLocal plant: ${localPlantName}\nLocal plant ID: ${audit.plantId}\nCached server plants:\n${serverPlantNames || "(none)"}\nNo data was uploaded.`,
+      );
+    }
+
+    const assets: AuditManifestPayload["assets"] = [];
+    const responses: AuditManifestPayload["responses"] = [];
+    const photoQueue: Array<{ checkpointId: string; photoIndex: number; photo: PhotoItem; questionId: number; assetRef: string }> = [];
+    for (const eq of execution) {
+      const typeNorm = normalizeMappingText(eq.equipmentType);
+      const isSafety = typeNorm.includes("safety");
+      const isCivil = typeNorm.includes("civil");
+      const assetRef = isSafety ? "Site Safety" : isCivil ? "Civil / Infrastructure" : eq.id;
+      let serverType: any = null;
+      if (!isSafety && !isCivil) {
+        const candidates = ref.asset_types.filter((t: any) => normalizeMappingText(t.name) === typeNorm);
+        if (candidates.length !== 1) throw new Error(`Equipment type “${eq.equipmentType}” has ${candidates.length} exact server type matches. No data was uploaded.`);
+        serverType = candidates[0];
+        assets.push({ asset_ref: assetRef, asset_type_id: Number(serverType.id), asset_name: eq.name, location: "", rank: "N/A", observation: "", remarks: "", is_audited: eq.checkpoints.some((cp) => cp.result !== "NA") });
+      }
+      for (const cp of eq.checkpoints) {
+        const questionTypeName = isSafety ? "Site Safety" : isCivil ? "Civil / Infrastructure" : String(serverType?.name ?? "");
+        const questionMatches = ref.checklist.questions.filter((q: any) => normalizeMappingText(q.text) === normalizeMappingText(cp.checkpointText) && normalizeMappingText(q.asset_type_name) === normalizeMappingText(questionTypeName));
+        if (questionMatches.length !== 1) throw new Error(`Checkpoint “${cp.checkpointText}” has ${questionMatches.length} exact server question matches for “${questionTypeName}”. No data was uploaded.`);
+        const result = cp.result === "C" ? "pass" : cp.result === "NC" ? "fail" : cp.result === "OFI" ? "ofi" : "na";
+        const localObs = existingObservations.find((o) =>
+          o.auditId === audit.id &&
+          (o.checkpointId === cp.id || normalizeMappingText(o.checkpointText || o.title) === normalizeMappingText(cp.checkpointText))
+        );
+        const obsText = (cp.result === "NC" || cp.result === "OFI")
+          ? (localObs?.description?.trim() || cp.remarks?.trim() || "")
+          : "";
+        responses.push({ asset_ref: assetRef, question_id: Number(questionMatches[0].id), response_status: result, remarks: cp.remarks || "", observation: obsText });
+        (cp.photos ?? []).forEach((photo, photoIndex) => photoQueue.push({ checkpointId: cp.id, photoIndex, photo, questionId: Number(questionMatches[0].id), assetRef }));
+      }
+    }
+    const payload: AuditManifestPayload = {
+      local_uuid: audit.id, plant_id: String(serverPlant.id), plant_name: String(serverPlant.name),
+      audit_date: audit.auditDate || new Date().toISOString().slice(0, 10), audit_time: "", audit_type: audit.auditType,
+      auditor_name: audit.auditor || serverBootstrap?.user?.full_name || serverBootstrap?.user?.username || "", auditee_name: "",
+      building_name: "", capacity_mw: String(serverPlant.capacity_mw ?? current.plants.find((p) => p.id === audit.plantId)?.capacityMw ?? ""),
+      city: "", state: "", asset_id_ref: "", assets, responses,
+    };
+    return { payload, photoQueue };
+  }
+
+  async function tryImmediateCheckpointPhotoUpload(audit: LocalAudit, equipmentId: string, checkpointId: string) {
+    if (!serverToken || (typeof navigator !== "undefined" && !navigator.onLine)) return;
+    try {
+      const cached = await loadCachedServerReferenceData();
+      const ref = cached?.data;
+      if (!ref || !Array.isArray(ref.plants) || !Array.isArray(ref.asset_types) || !Array.isArray(ref.checklist?.questions)) return;
+      const execution = await loadAuditExecutionPhotoRefs(audit.id);
+      const existingObservations = await loadObservations();
+      const { payload, photoQueue } = buildAuditManifestData(audit, ref, execution, existingObservations);
+      const pending = photoQueue.filter((item) => item.checkpointId === checkpointId && !item.photo.uploaded);
+      if (!pending.length) return;
+
+      const acknowledgement = await syncAuditManifest(serverBaseUrl, serverToken, audit.id, payload);
+      await saveAuditSyncAcknowledgement(audit.id, acknowledgement);
+
+      const syncedSrcs = new Map<string, string>();
+      for (const item of pending) {
+        const dataUrl = await resolvePhotoRef(item.photo.src);
+        if (!dataUrl) continue;
+        const photoId = buildDeterministicPhotoId(audit.id, item.checkpointId, item.photo.src.startsWith("capfs:") ? item.photo.src : dataUrl);
+        const serverAssetId = !["Site Safety", "Civil / Infrastructure"].includes(item.assetRef)
+          ? String(acknowledgement.asset_map?.[item.assetRef] ?? "")
+          : undefined;
+        if (!["Site Safety", "Civil / Infrastructure"].includes(item.assetRef) && !serverAssetId) continue;
+        await syncAuditPhoto(serverBaseUrl, serverToken, audit.id, photoId, {
+          question_id: item.questionId,
+          asset_ref: item.assetRef,
+          asset_id: serverAssetId,
+          dataUrl,
+          captured_at: item.photo.capturedAt ?? undefined,
+          latitude: item.photo.latitude,
+          longitude: item.photo.longitude,
+          gps_accuracy: item.photo.accuracy,
+          remark: item.photo.remark,
+        });
+        syncedSrcs.set(item.photo.src, item.photo.remark ?? "");
+      }
+
+      if (syncedSrcs.size > 0) {
+        const latestExecution = await loadAuditExecutionPhotoRefs(audit.id);
+        const latestCp = latestExecution.find((eq) => eq.id === equipmentId)?.checkpoints.find((cp) => cp.id === checkpointId);
+        if (latestCp) {
+          const markedCp: AuditCheckpoint = {
+            ...latestCp,
+            photos: (latestCp.photos ?? []).map((p) =>
+              syncedSrcs.has(p.src) ? { ...p, uploaded: true, uploadedRemark: syncedSrcs.get(p.src) } : p,
+            ),
+          };
+          await updateAuditCheckpoint(audit.id, markedCp);
+          setExecutionEquipment((curr) => curr.map((eq) => eq.id === equipmentId
+            ? {
+                ...eq,
+                checkpoints: eq.checkpoints.map((cp) => cp.id === checkpointId
+                  ? {
+                      ...cp,
+                      photos: (cp.photos ?? []).map((p) =>
+                        syncedSrcs.has(p.src) ? { ...p, uploaded: true, uploadedRemark: syncedSrcs.get(p.src) } : p,
+                      ),
+                    }
+                  : cp),
+              }
+            : eq));
+        }
+      }
+    } catch (err) {
+      console.warn("[Solar Audit] Immediate photo upload deferred to final sync:", err);
+    }
+  }
+
   async function syncOneAuditManifest(audit: LocalAudit, options?: { throwOnFailure?: boolean }) {
     if (!serverToken) {
       const msg = "Sign in to the native API in Settings first.";
@@ -1771,75 +1929,12 @@ export default function App() {
       if (!ref || !Array.isArray(ref.plants) || !Array.isArray(ref.asset_types) || !Array.isArray(ref.checklist?.questions)) {
         throw new Error("Download & cache reference data in Settings before syncing.");
       }
-      const localPlantName =
-        audit.plantName ||
-        current.plants.find((p) => p.id === audit.plantId)?.name ||
-        "(unknown local plant)";
-
-      const localPlant = current.plants.find((p) => p.id === audit.plantId);
-      const exactServerIdMatch = localPlant?.serverPlantId
-        ? ref.plants.find((p: any) => String(p.id) === String(localPlant.serverPlantId))
-        : undefined;
-      const exactNameMatch = localPlant?.serverPlantId
-        ? undefined
-        : ref.plants.find((p: any) => normalizeMappingText(p.name) === normalizeMappingText(localPlantName));
-
-      const serverPlant = exactServerIdMatch || exactNameMatch;
-
-      if (!serverPlant) {
-        const serverPlantNames = ref.plants
-          .map((p: any) => `${p.name} [ID: ${p.id}]`)
-          .join("\n");
-
-        throw new Error(
-          `Plant mapping failed.\n` +
-          `Local plant: ${localPlantName}\n` +
-          `Local plant ID: ${audit.plantId}\n` +
-          `Cached server plants:\n${serverPlantNames || "(none)"}\n` +
-          `No data was uploaded.`
-        );
-      }
       const execution = await loadAuditExecutionPhotoRefs(audit.id);
       if (!execution.length || !execution.some((eq) => eq.checkpoints.length)) throw new Error("This audit has no checkpoints to sync yet.");
       const existingObservations = await loadObservations();
-      const assets: AuditManifestPayload["assets"] = [];
-      const responses: AuditManifestPayload["responses"] = [];
-      const photoQueue: Array<{ checkpointId: string; photoIndex: number; photo: PhotoItem; questionId: number; assetRef: string }> = [];
-      for (const eq of execution) {
-        const typeNorm = normalizeMappingText(eq.equipmentType);
-        const isSafety = typeNorm.includes("safety");
-        const isCivil = typeNorm.includes("civil");
-        const assetRef = isSafety ? "Site Safety" : isCivil ? "Civil / Infrastructure" : eq.id;
-        let serverType: any = null;
-        if (!isSafety && !isCivil) {
-          const candidates = ref.asset_types.filter((t: any) => normalizeMappingText(t.name) === typeNorm);
-          if (candidates.length !== 1) throw new Error(`Equipment type “${eq.equipmentType}” has ${candidates.length} exact server type matches. No data was uploaded.`);
-          serverType = candidates[0];
-          assets.push({ asset_ref: assetRef, asset_type_id: Number(serverType.id), asset_name: eq.name, location: "", rank: "N/A", observation: "", remarks: "", is_audited: eq.checkpoints.some((cp) => cp.result !== "NA") });
-        }
-        for (const cp of eq.checkpoints) {
-          const questionTypeName = isSafety ? "Site Safety" : isCivil ? "Civil / Infrastructure" : String(serverType?.name ?? "");
-          const questionMatches = ref.checklist.questions.filter((q: any) => normalizeMappingText(q.text) === normalizeMappingText(cp.checkpointText) && normalizeMappingText(q.asset_type_name) === normalizeMappingText(questionTypeName));
-          if (questionMatches.length !== 1) throw new Error(`Checkpoint “${cp.checkpointText}” has ${questionMatches.length} exact server question matches for “${questionTypeName}”. No data was uploaded.`);
-          const result = cp.result === "C" ? "pass" : cp.result === "NC" ? "fail" : cp.result === "OFI" ? "ofi" : "na";
-          const localObs = existingObservations.find((o) =>
-            o.auditId === audit.id &&
-            (o.checkpointId === cp.id || normalizeMappingText(o.checkpointText || o.title) === normalizeMappingText(cp.checkpointText))
-          );
-          const obsText = (cp.result === "NC" || cp.result === "OFI")
-            ? (localObs?.description?.trim() || cp.remarks?.trim() || "")
-            : "";
-          responses.push({ asset_ref: assetRef, question_id: Number(questionMatches[0].id), response_status: result, remarks: cp.remarks || "", observation: obsText });
-          (cp.photos ?? []).forEach((photo, photoIndex) => photoQueue.push({ checkpointId: cp.id, photoIndex, photo, questionId: Number(questionMatches[0].id), assetRef }));
-        }
-      }
-      const payload: AuditManifestPayload = {
-        local_uuid: audit.id, plant_id: String(serverPlant.id), plant_name: String(serverPlant.name),
-        audit_date: audit.auditDate || new Date().toISOString().slice(0, 10), audit_time: "", audit_type: audit.auditType,
-        auditor_name: audit.auditor || serverBootstrap?.user?.full_name || serverBootstrap?.user?.username || "", auditee_name: "",
-        building_name: "", capacity_mw: String(serverPlant.capacity_mw ?? current.plants.find((p) => p.id === audit.plantId)?.capacityMw ?? ""),
-        city: "", state: "", asset_id_ref: "", assets, responses,
-      };
+      const { payload, photoQueue: allPhotos } = buildAuditManifestData(audit, ref, execution, existingObservations);
+      const photoQueue = allPhotos.filter((item) => !(item.photo.uploaded && (item.photo.remark ?? "") === (item.photo.uploadedRemark ?? "")));
+      const alreadySyncedCount = allPhotos.length - photoQueue.length;
       const acknowledgement = await syncAuditManifest(serverBaseUrl, serverToken, audit.id, payload);
       await saveAuditSyncAcknowledgement(audit.id, acknowledgement);
       await refreshServerObservations(audit.id);
@@ -1848,7 +1943,9 @@ export default function App() {
       const photoErrors: string[] = [];
       const totalPhotos = photoQueue.length;
       if (totalPhotos > 0) {
-        setAuditSyncMessages((old) => ({ ...old, [audit.id]: `Manifest synced. Uploading 0 / ${totalPhotos} photos…` }));
+        setAuditSyncMessages((old) => ({ ...old, [audit.id]: `Manifest synced. Uploading 0 / ${totalPhotos} remaining photo(s)…` }));
+      } else if (alreadySyncedCount > 0) {
+        setAuditSyncMessages((old) => ({ ...old, [audit.id]: `Manifest synced. All ${alreadySyncedCount} photo(s) were already synced live.` }));
       }
       let queueCursor = 0;
       const uploadWorker = async () => {
@@ -1857,18 +1954,7 @@ export default function App() {
           try {
             const dataUrl = await resolvePhotoRef(item.photo.src);
             if (!dataUrl) throw new Error("Photo file could not be read from device storage.");
-            // Content-addressed RFC-4122 UUID derived from the audit, checkpoint, and file/image identity.
-            const seed = `${audit.id}:${item.checkpointId}:${item.photo.src.startsWith("capfs:") ? item.photo.src : dataUrl}`;
-            const hash32 = (input: string, salt: number) => {
-              let hash = (2166136261 ^ salt) >>> 0;
-              for (let i = 0; i < input.length; i++) hash = Math.imul(hash ^ input.charCodeAt(i), 16777619) >>> 0;
-              return hash.toString(16).padStart(8, "0");
-            };
-            const raw = `${hash32(seed, 0)}${hash32(seed, 0x9e3779b9)}${hash32(seed, 0x85ebca6b)}${hash32(seed, 0xc2b2ae35)}`.split("");
-            raw[12] = "4"; // UUID version 4 shape
-            raw[16] = ((parseInt(raw[16], 16) & 0x3) | 0x8).toString(16); // RFC variant
-            const hex = raw.join("");
-            const photoId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+            const photoId = buildDeterministicPhotoId(audit.id, item.checkpointId, item.photo.src.startsWith("capfs:") ? item.photo.src : dataUrl);
             const serverAssetId = !["Site Safety", "Civil / Infrastructure"].includes(item.assetRef)
               ? String(acknowledgement.asset_map?.[item.assetRef] ?? "")
               : undefined;
@@ -1906,7 +1992,7 @@ export default function App() {
         await completeServerAudit(serverBaseUrl, serverToken, audit.id);
         await refreshServerObservations(audit.id);
       }
-      const summary = `Manifest synced. Audit #${acknowledgement.audit_number ?? "received"}; ${assets.length} assets, ${responses.length} responses; ${photosUploaded}/${photoQueue.length} photos uploaded.`;
+      const summary = `Manifest synced. Audit #${acknowledgement.audit_number ?? "received"}; ${payload.assets.length} assets, ${payload.responses.length} responses; ${photosUploaded}/${photoQueue.length} remaining photo(s) uploaded${alreadySyncedCount ? ` (${alreadySyncedCount} already synced live)` : ""}.`;
       setAuditSyncMessages((old) => ({ ...old, [audit.id]: photoErrors.length ? `${summary} Photo errors: ${photoErrors.slice(0, 2).join("; ")}` : `${summary} ${photoQueue.length ? "Photos confirmed by server." : "No checkpoint photos were attached to this audit."}` }));
     } catch (error) {
       setAuditSyncMessages((old) => ({ ...old, [audit.id]: error instanceof Error ? error.message : "Manifest sync failed. Local audit remains unchanged." }));
