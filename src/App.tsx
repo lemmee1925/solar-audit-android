@@ -355,61 +355,175 @@ export default function App() {
         pdf.setTextColor(...color);
         const lines = pdf.splitTextToSize(value || "—", maxWidth);
         pdf.text(lines, x, yy);
-        return lines.length * (size * 0.42) + 1.5;
+        return lines.length * (size * 0.43) + 1.5;
       };
       const section = (title: string, subtitle = "") => {
-        ensure(subtitle ? 14 : 10);
+        ensure(subtitle ? 15 : 11);
         y += 3;
         pdf.setFont("helvetica", "bold"); pdf.setFontSize(13); pdf.setTextColor(...NAVY);
         pdf.text(title, M, y);
         y += 3;
         pdf.setDrawColor(...GREEN); pdf.setLineWidth(0.65); pdf.line(M, y, W - M, y);
-        y += 4;
+        y += 4.5;
         if (subtitle) { y += text(subtitle, M, y, CW, 8, false, [105, 112, 121]); }
+      };
+      const drawTable = (
+        headers: string[],
+        widths: number[],
+        rows: Array<{ cells: string[]; boldCols?: number[]; colorCols?: Record<number, [number, number, number]> }>,
+        fontSize = 7,
+      ) => {
+        const lineStep = fontSize * 0.44;
+        const padX = 2;
+        const padTop = 3.8;
+        const padBottom = 2;
+        const headerH = 7.5;
+        const drawHeader = () => {
+          ensure(headerH + 8);
+          let hx = M;
+          headers.forEach((h, i) => {
+            pdf.setFillColor(...NAVY);
+            pdf.rect(hx, y, widths[i], headerH, "F");
+            pdf.setFont("helvetica", "bold");
+            pdf.setFontSize(fontSize);
+            pdf.setTextColor(255, 255, 255);
+            const hLines = pdf.splitTextToSize(h, widths[i] - padX * 2);
+            pdf.text(hLines, hx + padX, y + 4.8);
+            hx += widths[i];
+          });
+          y += headerH;
+        };
+        drawHeader();
+        rows.forEach((row, rowIndex) => {
+          const wrapped = row.cells.map((val, colIdx) => pdf.splitTextToSize(val || "—", Math.max(4, widths[colIdx] - padX * 2)));
+          const maxLines = Math.max(1, ...wrapped.map((lines) => lines.length));
+          const rowH = Math.max(7, maxLines * lineStep + padTop + padBottom - 1.5);
+          if (y + rowH > H - 16) {
+            newPage();
+            drawHeader();
+          }
+          let cx = M;
+          wrapped.forEach((lines, colIdx) => {
+            if (rowIndex % 2 === 0) {
+              pdf.setFillColor(...PALE);
+              pdf.rect(cx, y, widths[colIdx], rowH, "F");
+            }
+            pdf.setDrawColor(...GRID);
+            pdf.rect(cx, y, widths[colIdx], rowH);
+            const isBold = Boolean(row.boldCols?.includes(colIdx));
+            const colColor = row.colorCols?.[colIdx] ?? TEXT;
+            pdf.setFont("helvetica", isBold ? "bold" : "normal");
+            pdf.setFontSize(fontSize);
+            pdf.setTextColor(...colColor);
+            pdf.text(lines, cx + padX, y + padTop);
+            cx += widths[colIdx];
+          });
+          y += rowH;
+        });
       };
       const tableRow = (label: string, value: string, index: number, labelWidth = 48) => {
         const valLines = pdf.splitTextToSize(value || "N/A", CW - labelWidth - 5);
-        const h = Math.max(7, valLines.length * 4 + 2);
+        const h = Math.max(7.2, valLines.length * 3.8 + 3);
         ensure(h);
-        if (index % 2 === 0) { pdf.setFillColor(...PALE); pdf.rect(M, y - 4.2, CW, h, "F"); }
-        pdf.setDrawColor(...GRID); pdf.rect(M, y - 4.2, CW, h);
-        pdf.line(M + labelWidth, y - 4.2, M + labelWidth, y - 4.2 + h);
-        text(label, M + 2, y, labelWidth - 4, 7.5, true, [105, 112, 121]);
-        text(value || "N/A", M + labelWidth + 2, y, CW - labelWidth - 4, 8);
+        if (index % 2 === 0) { pdf.setFillColor(...PALE); pdf.rect(M, y, CW, h, "F"); }
+        pdf.setDrawColor(...GRID); pdf.rect(M, y, CW, h);
+        pdf.line(M + labelWidth, y, M + labelWidth, y + h);
+        text(label, M + 2.2, y + 4.5, labelWidth - 4.4, 7.5, true, [105, 112, 121]);
+        text(value || "N/A", M + labelWidth + 2.2, y + 4.5, CW - labelWidth - 4.4, 8);
         y += h;
       };
       const headerBand = (title: string, right = "") => {
-        ensure(9);
-        pdf.setFillColor(...NAVY); pdf.rect(M, y - 4.5, CW, 8, "F");
-        text(title, M + 2, y, CW - 25, 9, true, [255, 255, 255]);
-        if (right) text(right, W - M - 2 - 20, y, 18, 9, true, [255, 255, 255]);
-        y += 8;
+        ensure(10);
+        pdf.setFillColor(...NAVY); pdf.rect(M, y, CW, 7.5, "F");
+        text(title, M + 2.5, y + 5, CW - 28, 8.8, true, [255, 255, 255]);
+        if (right) text(right, W - M - 22, y + 5, 19, 8.8, true, [255, 255, 255]);
+        y += 8.5;
       };
-      const addPhoto = (photo: string, caption: string, kind: string) => {
-        if (!photo || !photo.startsWith("data:image/")) return;
-        const boxW = (CW - 4) / 2;
-        const boxH = 49;
-        if (y + boxH + 8 > H - 16) newPage();
-        const currentX = (photoIndex % 2 === 0) ? M : M + boxW + 4;
-        if (photoIndex % 2 === 0) {
-          ensure(boxH + 8);
-          photoRowStart = y;
-        }
-        try {
-          const fmt = photo.startsWith("data:image/png") ? "PNG" : "JPEG";
-          pdf.setDrawColor(...GRID);
-          pdf.rect(currentX, photoRowStart - 3, boxW, boxH + 7);
-          pdf.addImage(photo, fmt, currentX + 2, photoRowStart - 1, boxW - 4, 34, undefined, "FAST");
-          text(kind, currentX + 2, photoRowStart + 36, boxW - 4, 7, true, NAVY);
-          text(caption, currentX + 2, photoRowStart + 40, boxW - 4, 6.5, false, TEXT);
-          photoIndex++;
-          if (photoIndex % 2 === 0) y = photoRowStart + boxH + 6;
-        } catch (error) {
-          console.warn("Skipping a photo that could not be embedded in the PDF", error);
+      type PdfPhotoEntry = {
+        src: string;
+        kind: string;
+        caption: string;
+        remark?: string;
+        latitude?: number | null;
+        longitude?: number | null;
+      };
+      const getImageDims = (dataUrl: string) => new Promise<{ w: number; h: number }>((resolve) => {
+        const img = new window.Image();
+        img.onload = () => resolve({ w: img.naturalWidth || 4, h: img.naturalHeight || 3 });
+        img.onerror = () => resolve({ w: 4, h: 3 });
+        img.src = dataUrl;
+      });
+      const renderPhotoGrid = async (entries: PdfPhotoEntry[]) => {
+        const valid = entries.filter((item) => item.src && item.src.startsWith("data:image/"));
+        if (!valid.length) return;
+        const gap = 4;
+        const boxW = (CW - gap) / 2;
+        const maxImgW = boxW - 4;
+        const maxImgH = 42;
+        const dimsList = await Promise.all(valid.map((item) => getImageDims(item.src)));
+
+        for (let i = 0; i < valid.length; i += 2) {
+          const pair = valid.slice(i, i + 2);
+          const pairDims = dimsList.slice(i, i + 2);
+          const cardMetrics = pair.map((item, j) => {
+            const capLines = pdf.splitTextToSize(item.caption || "Inspection photo", boxW - 4);
+            const remLines = item.remark ? pdf.splitTextToSize(`Remark: ${item.remark}`, boxW - 4) : [];
+            const hasGps = typeof item.latitude === "number" && typeof item.longitude === "number";
+            const imgScale = Math.min(maxImgW / pairDims[j].w, maxImgH / pairDims[j].h);
+            const drawW = pairDims[j].w * imgScale;
+            const drawH = pairDims[j].h * imgScale;
+            const textH =
+              4.2 + // kind heading
+              capLines.length * 3.0 + 1.2 +
+              (remLines.length ? remLines.length * 3.2 + 1.4 : 0) +
+              (hasGps ? 4.2 : 0);
+            const cardH = 3 + maxImgH + 3.5 + textH + 2.5;
+            return { capLines, remLines, hasGps, drawW, drawH, cardH };
+          });
+          const rowH = Math.max(...cardMetrics.map((m) => m.cardH));
+          ensure(rowH + 3);
+          const rowTop = y;
+          pair.forEach((item, j) => {
+            const m = cardMetrics[j];
+            const cardX = M + j * (boxW + gap);
+            pdf.setDrawColor(...GRID);
+            pdf.setFillColor(255, 255, 255);
+            pdf.rect(cardX, rowTop, boxW, rowH, "FD");
+            try {
+              const fmt = item.src.startsWith("data:image/png") ? "PNG" : "JPEG";
+              const imgX = cardX + 2 + (maxImgW - m.drawW) / 2;
+              const imgY = rowTop + 2.5 + (maxImgH - m.drawH) / 2;
+              pdf.addImage(item.src, fmt, imgX, imgY, m.drawW, m.drawH, undefined, "FAST");
+            } catch (error) {
+              console.warn("Skipping a photo that could not be embedded in the PDF", error);
+            }
+            let ty = rowTop + 2.5 + maxImgH + 4.2;
+            pdf.setFont("helvetica", "bold"); pdf.setFontSize(7.2); pdf.setTextColor(...NAVY);
+            pdf.text(item.kind, cardX + 2, ty);
+            ty += 3.8;
+            pdf.setFont("helvetica", "normal"); pdf.setFontSize(6.5); pdf.setTextColor(...TEXT);
+            pdf.text(m.capLines, cardX + 2, ty);
+            ty += m.capLines.length * 3.0 + 1.2;
+            if (m.remLines.length) {
+              pdf.setFont("helvetica", "bold"); pdf.setFontSize(6.8); pdf.setTextColor(...NAVY);
+              pdf.text(m.remLines, cardX + 2, ty);
+              ty += m.remLines.length * 3.2 + 1.4;
+            }
+            if (m.hasGps) {
+              const lat = item.latitude as number;
+              const lon = item.longitude as number;
+              const gpsLabel = `GPS: ${lat.toFixed(5)}, ${lon.toFixed(5)} (Open in Maps)`;
+              const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${lat.toFixed(6)},${lon.toFixed(6)}`;
+              pdf.setFont("helvetica", "bold"); pdf.setFontSize(6.6); pdf.setTextColor(21, 128, 61);
+              pdf.textWithLink(gpsLabel, cardX + 2, ty, { url: mapsUrl });
+              const lw = pdf.getTextWidth(gpsLabel);
+              pdf.setDrawColor(21, 128, 61);
+              pdf.line(cardX + 2, ty + 0.6, cardX + 2 + lw, ty + 0.6);
+            }
+          });
+          y = rowTop + rowH + 3;
         }
       };
-      let photoIndex = 0;
-      let photoRowStart = y;
 
       // Cover page — branded, clean and intentionally restrained.
       pdf.setFillColor(...NAVY); pdf.rect(M, 20, CW, 62, "F");
@@ -465,21 +579,22 @@ export default function App() {
       ensure(8); text("SITE RATING", M, y, 72, 7.5, true, [105, 112, 121]); text(rating, W - M - 1 - 48, y, 48, 9, true, GREEN); y += 8;
       ensure(8); text(`Observations: ${auditObservations.length}     Open / in follow-up: ${openCount}     Closed: ${closedCount}`, M, y, CW, 8, true); y += 7;
       headerBand("Compliance by Equipment Type");
-      const colWidths = [58, 25, 29, 27, CW - 139];
-      const headers = ["Equipment Type", "Complied", "Not Complied", "N/A", "Compliance"];
-      let xx = M;
-      headers.forEach((h, i) => { pdf.setFillColor(...NAVY); pdf.rect(xx, y - 4.5, colWidths[i], 8, "F"); text(h, xx + 1.5, y, colWidths[i] - 3, 6.8, true, [255, 255, 255]); xx += colWidths[i]; });
-      y += 4;
-      execution.forEach((equipment, i) => {
-        const c = equipment.checkpoints.filter((p) => p.result === "C").length;
-        const nc = equipment.checkpoints.filter((p) => p.result === "NC").length;
-        const n = equipment.checkpoints.filter((p) => p.result === "NA").length;
-        const pct = c + nc ? c / (c + nc) * 100 : 0;
-        const vals = [equipment.equipmentType || equipment.name, String(c), String(nc), String(n), `${pct.toFixed(1)}%`];
-        ensure(7); xx = M;
-        vals.forEach((v, j) => { if (i % 2 === 0) { pdf.setFillColor(...PALE); pdf.rect(xx, y - 4.5, colWidths[j], 7, "F"); } pdf.setDrawColor(...GRID); pdf.rect(xx, y - 4.5, colWidths[j], 7); text(v, xx + 1.5, y, colWidths[j] - 3, 7, j === 0); xx += colWidths[j]; });
-        y += 7;
-      });
+      const colWidths = [CW - 102, 24, 28, 22, 28];
+      drawTable(
+        ["Equipment Type", "Complied", "Not Complied", "N/A", "Compliance"],
+        colWidths,
+        execution.map((equipment) => {
+          const c = equipment.checkpoints.filter((p) => p.result === "C").length;
+          const nc = equipment.checkpoints.filter((p) => p.result === "NC").length;
+          const n = equipment.checkpoints.filter((p) => p.result === "NA").length;
+          const pct = c + nc ? (c / (c + nc)) * 100 : 0;
+          return {
+            cells: [equipment.equipmentType || equipment.name, String(c), String(nc), String(n), `${pct.toFixed(1)}%`],
+            boldCols: [0],
+          };
+        }),
+        7.2,
+      );
 
       newPage();
       section("02  Plant & Audit Information", "Core identification and site configuration captured for this audit.");
@@ -498,37 +613,36 @@ export default function App() {
         const nc = equipment.checkpoints.filter((p) => p.result === "NC").length;
         const pct = c + nc ? c / (c + nc) * 100 : 0;
         headerBand(`${String(ei + 1).padStart(2, "0")}  ${equipment.name} | ${equipment.equipmentType}`, `${pct.toFixed(0)}%`);
-        const rows = [["#", "Inspection Point", "Result", "Remarks"]];
-        const widths = [8, CW * 0.52, 30, CW - 8 - CW * 0.52 - 30];
-        let hx = M;
-        rows[0].forEach((h, i) => { pdf.setFillColor(...NAVY); pdf.rect(hx, y - 4.5, widths[i], 8, "F"); text(h, hx + 1, y, widths[i] - 2, 7, true, [255, 255, 255]); hx += widths[i]; });
-        y += 4;
-        if (!equipment.checkpoints.length) { text("No checkpoints saved.", M + 2, y, CW - 4, 8); y += 6; }
-        for (let ci = 0; ci < equipment.checkpoints.length; ci++) {
-          const cp = equipment.checkpoints[ci];
-          const pointLines = pdf.splitTextToSize(cp.checkpointText || "Checkpoint", widths[1] - 3);
-          const remarkLines = pdf.splitTextToSize(cp.remarks || "", widths[3] - 3);
-          const rowH = Math.max(7, pointLines.length * 3.2 + 3, remarkLines.length * 3.2 + 3);
-          ensure(rowH + 1);
-          let x = M;
-          widths.forEach((w) => { if (ci % 2 === 0) { pdf.setFillColor(...PALE); pdf.rect(x, y - 4.5, w, rowH, "F"); } pdf.setDrawColor(...GRID); pdf.rect(x, y - 4.5, w, rowH); x += w; });
-          text(String(ci + 1), M + 1, y, widths[0] - 2, 7);
-          text(cp.checkpointText || "Checkpoint", M + widths[0] + 1.5, y, widths[1] - 3, 7);
-          const resultColor: [number, number, number] = cp.result === "C" ? [83, 132, 65] : cp.result === "NC" ? [201, 77, 77] : [110, 118, 126];
-          text(statusLabel(cp.result), M + widths[0] + widths[1] + 1.5, y, widths[2] - 3, 6.8, true, resultColor);
-          text(cp.remarks || "", M + widths[0] + widths[1] + widths[2] + 1.5, y, widths[3] - 3, 6.8);
-          y += rowH;
+        const widths = [9, CW - 9 - 34 - 46, 34, 46];
+        if (!equipment.checkpoints.length) {
+          text("No checkpoints saved.", M + 2, y + 3, CW - 4, 8);
+          y += 7;
+        } else {
+          drawTable(
+            ["#", "Inspection Point", "Result", "Remarks"],
+            widths,
+            equipment.checkpoints.map((cp, ci) => {
+              const resultColor: [number, number, number] = cp.result === "C" ? [83, 132, 65] : cp.result === "NC" ? [201, 77, 77] : [110, 118, 126];
+              return {
+                cells: [String(ci + 1), cp.checkpointText || "Checkpoint", statusLabel(cp.result), cp.remarks || "—"],
+                boldCols: [2],
+                colorCols: { 2: resultColor },
+              };
+            }),
+            7,
+          );
         }
-        const photos = equipment.checkpoints.flatMap((cp) => (cp.photos ?? []).map((p, pi) => ({
-          photo: p.src,
-          caption: [cp.checkpointText, p.remark ? `Remark: ${p.remark}` : "", (typeof p.latitude === "number" && typeof p.longitude === "number") ? `GPS: ${p.latitude.toFixed(5)}, ${p.longitude.toFixed(5)}` : ""].filter(Boolean).join(" | "),
-          idx: pi,
+        const photos: PdfPhotoEntry[] = equipment.checkpoints.flatMap((cp) => (cp.photos ?? []).map((p) => ({
+          src: p.src,
+          kind: "Inspection Evidence",
+          caption: cp.checkpointText || "Inspection point",
+          remark: p.remark,
+          latitude: p.latitude,
+          longitude: p.longitude,
         })));
         if (photos.length) {
-          ensure(9); y += 3; text("Photo Evidence", M, y, CW, 9, true, NAVY); y += 4;
-          photoIndex = 0; photoRowStart = y;
-          photos.forEach((p) => addPhoto(p.photo, p.caption, "Inspection Evidence"));
-          if (photoIndex % 2 === 1) y = photoRowStart + 55;
+          ensure(10); y += 3; text("Photo Evidence", M, y + 2, CW, 9, true, NAVY); y += 5;
+          await renderPhotoGrid(photos);
           y += 2;
         }
         y += 4;
@@ -542,29 +656,52 @@ export default function App() {
       if (!civil.length) { text("No Civil / Infrastructure checkpoints were answered for this audit.", M, y, CW, 8); y += 6; }
 
       section("06  Observations & Closure Tracking", "Findings, severity, responsible person, target date and current closure status.");
-      const obsWidths = [7, 42, 50, 17, 25, 22, CW - 163];
-      const obsHeaders = ["#", "Equipment / Checkpoint", "Observation & Remarks", "Severity", "Responsible", "Target Date", "Status"];
-      let ox = M;
-      obsHeaders.forEach((h, i) => { pdf.setFillColor(...NAVY); pdf.rect(ox, y - 4.5, obsWidths[i], 8, "F"); text(h, ox + 1, y, obsWidths[i] - 2, 6, true, [255, 255, 255]); ox += obsWidths[i]; });
-      y += 4;
-      if (!auditObservations.length) { text("No observations recorded for this audit.", M, y, CW, 8); y += 6; }
-      auditObservations.forEach((o, i) => {
-        const values = [String(i + 1), `${o.title || "Finding"}\n${o.checkpointText || ""}`, `${o.description || "(no observation text)"}${o.actionText ? `\nAction taken: ${o.actionText}` : ""}`, o.severity || "Not set", o.responsiblePerson || "N/A", o.targetDate || "N/A", o.status || "Open"];
-        const lineCounts = values.map((v, j) => pdf.splitTextToSize(v, obsWidths[j] - 3).length);
-        const rowH = Math.max(10, Math.max(...lineCounts) * 3.2 + 4);
-        ensure(rowH + 1); ox = M;
-        values.forEach((v, j) => { if (i % 2 === 0) { pdf.setFillColor(...PALE); pdf.rect(ox, y - 4.5, obsWidths[j], rowH, "F"); } pdf.setDrawColor(...GRID); pdf.rect(ox, y - 4.5, obsWidths[j], rowH); text(v, ox + 1.5, y, obsWidths[j] - 3, 6.5, j === 1); ox += obsWidths[j]; });
-        y += rowH;
-        for (const p of (o.photos ?? [])) {
-          const cap = [o.checkpointText || o.title, p.remark ? `Remark: ${p.remark}` : "", (typeof p.latitude === "number" && typeof p.longitude === "number") ? `GPS: ${p.latitude.toFixed(5)}, ${p.longitude.toFixed(5)}` : ""].filter(Boolean).join(" | ");
-          addPhoto(p.src, cap, "Inspection Evidence");
+      const obsWidths = [8, 38, 46, 22, 24, 22, CW - 160];
+      if (!auditObservations.length) {
+        text("No observations recorded for this audit.", M, y + 3, CW, 8);
+        y += 7;
+      } else {
+        drawTable(
+          ["#", "Equipment / Checkpoint", "Observation & Remarks", "Severity", "Responsible", "Target Date", "Status"],
+          obsWidths,
+          auditObservations.map((o, i) => ({
+            cells: [
+              String(i + 1),
+              `${o.title || "Finding"}\n${o.checkpointText || ""}`,
+              `${o.description || "(no observation text)"}${o.actionText ? `\nAction taken: ${o.actionText}` : ""}`,
+              o.severity || "Not set",
+              o.responsiblePerson || "N/A",
+              o.targetDate || "N/A",
+              (o.status || "Open").replaceAll("_", " "),
+            ],
+            boldCols: [1],
+          })),
+          6.5,
+        );
+        y += 3;
+        const obsPhotos: PdfPhotoEntry[] = auditObservations.flatMap((o) => [
+          ...(o.photos ?? []).map((p) => ({
+            src: p.src,
+            kind: "Inspection Evidence",
+            caption: o.checkpointText || o.title || "Finding photo",
+            remark: p.remark,
+            latitude: p.latitude,
+            longitude: p.longitude,
+          })),
+          ...(o.actionPhotos ?? []).map((p) => ({
+            src: p.src,
+            kind: "Action-Taken Evidence",
+            caption: o.actionText || o.title || "Closure photo",
+            remark: p.remark,
+            latitude: p.latitude,
+            longitude: p.longitude,
+          })),
+        ]);
+        if (obsPhotos.length) {
+          ensure(10); text("Observation Photo Evidence", M, y + 2, CW, 9, true, NAVY); y += 5;
+          await renderPhotoGrid(obsPhotos);
         }
-        for (const p of (o.actionPhotos ?? [])) {
-          const cap = [o.actionText || o.title, p.remark ? `Remark: ${p.remark}` : "", (typeof p.latitude === "number" && typeof p.longitude === "number") ? `GPS: ${p.latitude.toFixed(5)}, ${p.longitude.toFixed(5)}` : ""].filter(Boolean).join(" | ");
-          addPhoto(p.src, cap, "Action-Taken Evidence");
-        }
-        if (photoIndex % 2 === 1) { y = photoRowStart + 55; photoIndex++; }
-      });
+      }
 
       section("07  Audit Sign-Off", "Final acknowledgement of the audit and its findings.");
       ensure(28);
