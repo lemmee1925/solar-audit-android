@@ -4,7 +4,7 @@ import { Filesystem, Directory } from "@capacitor/filesystem";
 import { Share } from "@capacitor/share";
 import "./styles.css";
 import { TECHNICAL_CHECKLISTS, TECHNICAL_CATEGORIES, SAFETY_CHECKLIST, CIVIL_CHECKLIST } from "./checklistLibrary";
-import { addAuditCheckpoint, addAuditEquipment, clearWorkspace, createAudit, initializeLocalDatabase, loadAuditExecution, loadAuditExecutionPhotoRefs, resolvePhotoRef, loadAudits, loadWorkspace, saveWorkspace, updateAuditCheckpoint, type AuditCheckpoint, type AuditEquipment, type AuditType, type LocalAudit, type LocalObservation, type FindingType, loadObservations, createObservation, deleteObservation, markAuditSubmitted, updateAuditType, updateObservationDetails, saveObservationActionPhotos, linkObservationToServer, markObservationSyncError, cacheServerReferenceData, loadCachedServerReferenceData, mergeServerPlantsIntoWorkspace, saveAuditSyncAcknowledgement, reconcileServerAuditStatuses } from "./db";
+import { addAuditCheckpoint, addAuditEquipment, clearWorkspace, createAudit, initializeLocalDatabase, loadAuditExecution, loadAuditExecutionPhotoRefs, resolvePhotoRef, loadAudits, loadWorkspace, saveWorkspace, updateAuditCheckpoint, type AuditCheckpoint, type AuditEquipment, type AuditType, type LocalAudit, type LocalObservation, type FindingType, type PhotoItem, loadObservations, createObservation, deleteObservation, markAuditSubmitted, updateAuditType, updateObservationDetails, saveObservationActionPhotos, linkObservationToServer, markObservationSyncError, cacheServerReferenceData, loadCachedServerReferenceData, mergeServerPlantsIntoWorkspace, saveAuditSyncAcknowledgement, reconcileServerAuditStatuses } from "./db";
 import { authenticateAndBootstrap, downloadSiteReferenceData, createServerPlant, createServerAsset, renameServerAsset, deleteServerAsset, getServerPlantSpecs, saveServerPlantSpecs, syncAuditManifest, syncAuditPhoto, completeServerAudit, fetchServerAuditStatuses, fetchServerObservations, saveServerObservationDetails, updateServerObservationAction, uploadServerObservationPhoto, type MobileBootstrap, type AuditManifestPayload } from "./serverApi";
 
 type PlantEquipment = {
@@ -85,6 +85,53 @@ function stableObservationPhotoId(observationId: string, dataUrl: string): strin
   raw[16] = ((parseInt(raw[16], 16) & 0x3) | 0x8).toString(16);
   const hex = raw.join("");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+async function captureCurrentLocation(): Promise<{ latitude: number; longitude: number; accuracy: number } | null> {
+  if (typeof navigator === "undefined" || !("geolocation" in navigator)) return null;
+  return new Promise((resolve) => {
+    try {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => resolve({
+          latitude: Number(pos.coords.latitude.toFixed(6)),
+          longitude: Number(pos.coords.longitude.toFixed(6)),
+          accuracy: Math.round(pos.coords.accuracy || 0),
+        }),
+        () => resolve(null),
+        { enableHighAccuracy: true, timeout: 7000, maximumAge: 15000 },
+      );
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+function openPhotoLocationInMaps(latitude: number, longitude: number) {
+  const lat = latitude.toFixed(6);
+  const lon = longitude.toFixed(6);
+  const geoUrl = `geo:${lat},${lon}?q=${lat},${lon}(Solar+Audit+Photo)`;
+  const webUrl = `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`;
+  const isNative = Boolean((window as Window & { Capacitor?: { isNativePlatform?: () => boolean } }).Capacitor?.isNativePlatform?.());
+  window.open(isNative ? geoUrl : webUrl, "_blank", "noopener,noreferrer");
+}
+
+function renderPhotoLocationBadge(photo: PhotoItem) {
+  if (typeof photo.latitude !== "number" || typeof photo.longitude !== "number") return null;
+  const lat = photo.latitude.toFixed(5);
+  const lon = photo.longitude.toFixed(5);
+  return (
+    <button
+      type="button"
+      className="photo-gps-badge"
+      title="Open this photo location in Maps"
+      onClick={(e) => {
+        e.stopPropagation();
+        openPhotoLocationInMaps(photo.latitude!, photo.longitude!);
+      }}
+    >
+      📍 {lat}, {lon}
+    </button>
+  );
 }
 
 async function photoFileToDataUrl(file: File): Promise<string> {
@@ -179,7 +226,7 @@ export default function App() {
   const [observationAction, setObservationAction] = useState("");
   const [observationTargetDate, setObservationTargetDate] = useState("");
   const [observationClosureDate, setObservationClosureDate] = useState("");
-  const [observationActionPhotos, setObservationActionPhotos] = useState<string[]>([]);
+  const [observationActionPhotos, setObservationActionPhotos] = useState<PhotoItem[]>([]);
   const [observationSearch, setObservationSearch] = useState("");
   const [observationFindingFilter, setObservationFindingFilter] = useState<"ALL" | FindingType>("ALL");
   const [observationStatusFilter, setObservationStatusFilter] = useState("all");
@@ -474,7 +521,11 @@ export default function App() {
           text(cp.remarks || "", M + widths[0] + widths[1] + widths[2] + 1.5, y, widths[3] - 3, 6.8);
           y += rowH;
         }
-        const photos = equipment.checkpoints.flatMap((cp) => (cp.photos ?? []).map((p, pi) => ({ photo: p, caption: cp.checkpointText, idx: pi })));
+        const photos = equipment.checkpoints.flatMap((cp) => (cp.photos ?? []).map((p, pi) => ({
+          photo: p.src,
+          caption: [cp.checkpointText, p.remark ? `Remark: ${p.remark}` : "", (typeof p.latitude === "number" && typeof p.longitude === "number") ? `GPS: ${p.latitude.toFixed(5)}, ${p.longitude.toFixed(5)}` : ""].filter(Boolean).join(" | "),
+          idx: pi,
+        })));
         if (photos.length) {
           ensure(9); y += 3; text("Photo Evidence", M, y, CW, 9, true, NAVY); y += 4;
           photoIndex = 0; photoRowStart = y;
@@ -506,8 +557,14 @@ export default function App() {
         ensure(rowH + 1); ox = M;
         values.forEach((v, j) => { if (i % 2 === 0) { pdf.setFillColor(...PALE); pdf.rect(ox, y - 4.5, obsWidths[j], rowH, "F"); } pdf.setDrawColor(...GRID); pdf.rect(ox, y - 4.5, obsWidths[j], rowH); text(v, ox + 1.5, y, obsWidths[j] - 3, 6.5, j === 1); ox += obsWidths[j]; });
         y += rowH;
-        for (const p of (o.photos ?? [])) addPhoto(p, o.checkpointText || o.title, "Inspection Evidence");
-        for (const p of (o.actionPhotos ?? [])) addPhoto(p, o.actionText || o.title, "Action-Taken Evidence");
+        for (const p of (o.photos ?? [])) {
+          const cap = [o.checkpointText || o.title, p.remark ? `Remark: ${p.remark}` : "", (typeof p.latitude === "number" && typeof p.longitude === "number") ? `GPS: ${p.latitude.toFixed(5)}, ${p.longitude.toFixed(5)}` : ""].filter(Boolean).join(" | ");
+          addPhoto(p.src, cap, "Inspection Evidence");
+        }
+        for (const p of (o.actionPhotos ?? [])) {
+          const cap = [o.actionText || o.title, p.remark ? `Remark: ${p.remark}` : "", (typeof p.latitude === "number" && typeof p.longitude === "number") ? `GPS: ${p.latitude.toFixed(5)}, ${p.longitude.toFixed(5)}` : ""].filter(Boolean).join(" | ");
+          addPhoto(p.src, cap, "Action-Taken Evidence");
+        }
         if (photoIndex % 2 === 1) { y = photoRowStart + 55; photoIndex++; }
       });
 
@@ -1048,16 +1105,44 @@ export default function App() {
     if (activeAudit.status === "submitted") return;
     try {
       const currentPhotos = checkpoint.photos ?? [];
-      const incoming = await Promise.all(Array.from(files).map(photoFileToDataUrl));
+      const [location, dataUrls] = await Promise.all([
+        captureCurrentLocation(),
+        Promise.all(Array.from(files).map(photoFileToDataUrl)),
+      ]);
+      const capturedAt = new Date().toISOString();
+      const incoming: PhotoItem[] = dataUrls.map((src) => ({
+        src,
+        remark: "",
+        latitude: location?.latitude ?? null,
+        longitude: location?.longitude ?? null,
+        accuracy: location?.accuracy ?? null,
+        capturedAt,
+      }));
       const updated = { ...checkpoint, photos: [...currentPhotos, ...incoming] };
       await updateAuditCheckpoint(activeAudit.id, updated);
       setExecutionEquipment((current) => current.map((eq) => eq.id === equipmentId
         ? { ...eq, checkpoints: eq.checkpoints.map((cp) => cp.id === checkpoint.id ? updated : cp) }
         : eq));
-      setMessage(`${incoming.length} photo${incoming.length === 1 ? "" : "s"} saved on this device.`);
+      setMessage(`${incoming.length} photo${incoming.length === 1 ? "" : "s"} saved${location ? ` with GPS (${location.latitude.toFixed(5)}, ${location.longitude.toFixed(5)})` : " on this device"}.`);
     } catch (error) {
       console.error("[Solar Audit] Photo capture/save failed:", error);
       setMessage("Photo could not be saved. Please try again with a smaller photo.");
+    }
+  }
+
+  async function updateCheckpointPhotoRemark(equipmentId: string, checkpoint: AuditCheckpoint, photoIndex: number, remark: string) {
+    if (!activeAudit || activeAudit.status === "submitted") return;
+    const updated = {
+      ...checkpoint,
+      photos: (checkpoint.photos ?? []).map((p, idx) => idx === photoIndex ? { ...p, remark } : p),
+    };
+    setExecutionEquipment((current) => current.map((eq) => eq.id === equipmentId
+      ? { ...eq, checkpoints: eq.checkpoints.map((cp) => cp.id === checkpoint.id ? updated : cp) }
+      : eq));
+    try {
+      await updateAuditCheckpoint(activeAudit.id, updated);
+    } catch (error) {
+      console.error("[Solar Audit] Photo remark save failed:", error);
     }
   }
 
@@ -1126,8 +1211,18 @@ export default function App() {
   }
 
   async function addObservationActionPhoto(file: File) {
-    try { setObservationActionPhotos((current) => current); const photo = await photoFileToDataUrl(file); setObservationActionPhotos((current) => [...current, photo]); }
-    catch (error) { console.error("[Solar Audit] Action photo processing failed:", error); setMessage("Action photo could not be processed. Please try another image."); }
+    try {
+      const [location, src] = await Promise.all([captureCurrentLocation(), photoFileToDataUrl(file)]);
+      const item: PhotoItem = {
+        src,
+        remark: "",
+        latitude: location?.latitude ?? null,
+        longitude: location?.longitude ?? null,
+        accuracy: location?.accuracy ?? null,
+        capturedAt: new Date().toISOString(),
+      };
+      setObservationActionPhotos((current) => [...current, item]);
+    } catch (error) { console.error("[Solar Audit] Action photo processing failed:", error); setMessage("Action photo could not be processed. Please try another image."); }
   }
 
   async function takeObservationActionPhoto() {
@@ -1260,8 +1355,13 @@ export default function App() {
             const workingStatuses = ["open", "in_progress", "rejected", "reopened"];
             if (workingStatuses.includes(latestServer.status)) {
               for (const photo of localItem.actionPhotos ?? []) {
-                const photoId = stableObservationPhotoId(localItem.id, photo);
-                await uploadServerObservationPhoto(serverBaseUrl, serverToken, latestServer.id, photoId, photo);
+                const photoId = stableObservationPhotoId(localItem.id, photo.src);
+                await uploadServerObservationPhoto(serverBaseUrl, serverToken, latestServer.id, photoId, photo.src, {
+                  captured_at: photo.capturedAt ?? undefined,
+                  latitude: photo.latitude,
+                  longitude: photo.longitude,
+                  gps_accuracy: photo.accuracy,
+                });
               }
               if (localItem.actionText.trim() || localItem.closureDate) {
                 latestServer = await updateServerObservationAction(serverBaseUrl, serverToken, latestServer.id, {
@@ -1355,8 +1455,13 @@ export default function App() {
       const refreshed = (await loadObservations()).find(item => item.id === observation.id) ?? observation;
       if (!refreshed.serverObservationId) throw new Error("No matching backend observation exists yet. Sync the audit manifest and submit the audit first.");
       for (const photo of refreshed.actionPhotos ?? []) {
-        const photoId = stableObservationPhotoId(refreshed.id, photo);
-        await uploadServerObservationPhoto(serverBaseUrl, serverToken, refreshed.serverObservationId, photoId, photo);
+        const photoId = stableObservationPhotoId(refreshed.id, photo.src);
+        await uploadServerObservationPhoto(serverBaseUrl, serverToken, refreshed.serverObservationId, photoId, photo.src, {
+          captured_at: photo.capturedAt ?? undefined,
+          latitude: photo.latitude,
+          longitude: photo.longitude,
+          gps_accuracy: photo.accuracy,
+        });
       }
       const result = await updateServerObservationAction(serverBaseUrl, serverToken, refreshed.serverObservationId, {
         do: "submit", action_taken: refreshed.actionText, closure_date: refreshed.closureDate,
@@ -1496,7 +1601,7 @@ export default function App() {
       const existingObservations = await loadObservations();
       const assets: AuditManifestPayload["assets"] = [];
       const responses: AuditManifestPayload["responses"] = [];
-      const photoQueue: Array<{ checkpointId: string; photoIndex: number; photoRef: string; questionId: number; assetRef: string }> = [];
+      const photoQueue: Array<{ checkpointId: string; photoIndex: number; photo: PhotoItem; questionId: number; assetRef: string }> = [];
       for (const eq of execution) {
         const typeNorm = normalizeMappingText(eq.equipmentType);
         const isSafety = typeNorm.includes("safety");
@@ -1522,7 +1627,7 @@ export default function App() {
             ? (localObs?.description?.trim() || cp.remarks?.trim() || "")
             : "";
           responses.push({ asset_ref: assetRef, question_id: Number(questionMatches[0].id), response_status: result, remarks: cp.remarks || "", observation: obsText });
-          (cp.photos ?? []).forEach((photoRef, photoIndex) => photoQueue.push({ checkpointId: cp.id, photoIndex, photoRef, questionId: Number(questionMatches[0].id), assetRef }));
+          (cp.photos ?? []).forEach((photo, photoIndex) => photoQueue.push({ checkpointId: cp.id, photoIndex, photo, questionId: Number(questionMatches[0].id), assetRef }));
         }
       }
       const payload: AuditManifestPayload = {
@@ -1545,12 +1650,12 @@ export default function App() {
       let queueCursor = 0;
       const uploadWorker = async () => {
         while (queueCursor < totalPhotos) {
-          const photo = photoQueue[queueCursor++];
+          const item = photoQueue[queueCursor++];
           try {
-            const dataUrl = await resolvePhotoRef(photo.photoRef);
+            const dataUrl = await resolvePhotoRef(item.photo.src);
             if (!dataUrl) throw new Error("Photo file could not be read from device storage.");
             // Content-addressed RFC-4122 UUID derived from the audit, checkpoint, and file/image identity.
-            const seed = `${audit.id}:${photo.checkpointId}:${photo.photoRef.startsWith("capfs:") ? photo.photoRef : dataUrl}`;
+            const seed = `${audit.id}:${item.checkpointId}:${item.photo.src.startsWith("capfs:") ? item.photo.src : dataUrl}`;
             const hash32 = (input: string, salt: number) => {
               let hash = (2166136261 ^ salt) >>> 0;
               for (let i = 0; i < input.length; i++) hash = Math.imul(hash ^ input.charCodeAt(i), 16777619) >>> 0;
@@ -1561,13 +1666,23 @@ export default function App() {
             raw[16] = ((parseInt(raw[16], 16) & 0x3) | 0x8).toString(16); // RFC variant
             const hex = raw.join("");
             const photoId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
-            const serverAssetId = !["Site Safety", "Civil / Infrastructure"].includes(photo.assetRef)
-              ? String(acknowledgement.asset_map?.[photo.assetRef] ?? "")
+            const serverAssetId = !["Site Safety", "Civil / Infrastructure"].includes(item.assetRef)
+              ? String(acknowledgement.asset_map?.[item.assetRef] ?? "")
               : undefined;
-            if (!["Site Safety", "Civil / Infrastructure"].includes(photo.assetRef) && !serverAssetId) {
-              throw new Error(`Backend did not return a server equipment ID for asset reference “${photo.assetRef}”. Re-sync the audit manifest before uploading its photos.`);
+            if (!["Site Safety", "Civil / Infrastructure"].includes(item.assetRef) && !serverAssetId) {
+              throw new Error(`Backend did not return a server equipment ID for asset reference “${item.assetRef}”. Re-sync the audit manifest before uploading its photos.`);
             }
-            await syncAuditPhoto(serverBaseUrl, serverToken, audit.id, photoId, { question_id: photo.questionId, asset_ref: photo.assetRef, asset_id: serverAssetId, dataUrl });
+            await syncAuditPhoto(serverBaseUrl, serverToken, audit.id, photoId, {
+              question_id: item.questionId,
+              asset_ref: item.assetRef,
+              asset_id: serverAssetId,
+              dataUrl,
+              captured_at: item.photo.capturedAt ?? undefined,
+              latitude: item.photo.latitude,
+              longitude: item.photo.longitude,
+              gps_accuracy: item.photo.accuracy,
+              remark: item.photo.remark,
+            });
             photosUploaded++;
           } catch (photoError) {
             photoErrors.push(photoError instanceof Error ? photoError.message : "Unknown photo upload error");
@@ -1780,7 +1895,7 @@ export default function App() {
                 {equipment.checkpoints.length > 0 && <div className="checkpoint-list">{equipment.checkpoints.map((checkpoint) => <div className="checkpoint-card" key={checkpoint.id}>
                   <div className="checkpoint-title"><b>{checkpoint.checkpointText}</b><span className={`result-pill result-${checkpoint.result.toLowerCase()}`}>{checkpoint.result}</span></div>
                   <div className="result-selector" role="group" aria-label={`Result for ${checkpoint.checkpointText}`}>{(["C", "NC", "NA", "OFI"] as const).map((result) => <button type="button" key={result} className={checkpoint.result === result ? `result-option selected result-${result.toLowerCase()}` : "result-option"} onClick={() => void handleCheckpointChange(equipment.id, checkpoint, { result })}>{result === "C" ? "Compliant (C)" : result === "NC" ? "Non-Compliant (NC)" : result === "NA" ? "Not Applicable (NA)" : "Opportunity for Improvement (OFI)"}</button>)}</div>
-                  <label className="remarks-label">Remarks<textarea value={checkpoint.remarks} onChange={(e) => void handleCheckpointChange(equipment.id, checkpoint, { remarks: e.target.value })} placeholder="Add inspection remarks..." rows={2} /></label><div className="checkpoint-photos"><div className="checkpoint-photo-heading"><b>Inspection photos</b><small>{(checkpoint.photos ?? []).length} saved</small></div><div className="photo-action-buttons"><button type="button" className="secondary-button photo-capture-button" disabled={activeAudit.status === "submitted"} onClick={() => void takeCheckpointPhoto(equipment.id, checkpoint)}>📷 Take Photo</button><label className="secondary-button photo-capture-button">🖼️ Choose from Gallery<input className="photo-file-input" type="file" accept="image/*" multiple disabled={activeAudit.status === "submitted"} onChange={(event) => { void handleCheckpointPhotos(equipment.id, checkpoint, event.currentTarget.files); event.currentTarget.value = ""; }} /></label></div>{(checkpoint.photos ?? []).length > 0 && <div className="checkpoint-photo-grid">{(checkpoint.photos ?? []).map((photo, photoIndex) => <div className="checkpoint-photo-item" key={`${checkpoint.id}-photo-${photoIndex}`}><img src={photo} alt={`Inspection photo ${photoIndex + 1}`} /><button type="button" disabled={activeAudit.status === "submitted"} aria-label={`Remove photo ${photoIndex + 1}`} onClick={() => void removeCheckpointPhoto(equipment.id, checkpoint, photoIndex)}>Remove</button></div>)}</div>}<small className="photo-storage-note">Photos are compressed and saved locally with this checkpoint for offline use.</small></div>
+                  <label className="remarks-label">Remarks<textarea value={checkpoint.remarks} onChange={(e) => void handleCheckpointChange(equipment.id, checkpoint, { remarks: e.target.value })} placeholder="Add inspection remarks..." rows={2} /></label><div className="checkpoint-photos"><div className="checkpoint-photo-heading"><b>Inspection photos</b><small>{(checkpoint.photos ?? []).length} saved</small></div><div className="photo-action-buttons"><button type="button" className="secondary-button photo-capture-button" disabled={activeAudit.status === "submitted"} onClick={() => void takeCheckpointPhoto(equipment.id, checkpoint)}>📷 Take Photo</button><label className="secondary-button photo-capture-button">🖼️ Choose from Gallery<input className="photo-file-input" type="file" accept="image/*" multiple disabled={activeAudit.status === "submitted"} onChange={(event) => { void handleCheckpointPhotos(equipment.id, checkpoint, event.currentTarget.files); event.currentTarget.value = ""; }} /></label></div>{(checkpoint.photos ?? []).length > 0 && <div className="checkpoint-photo-grid">{(checkpoint.photos ?? []).map((photo, photoIndex) => <div className="checkpoint-photo-item" key={`${checkpoint.id}-photo-${photoIndex}`}><div className="photo-thumb-wrap"><img src={photo.src} alt={`Inspection photo ${photoIndex + 1}`} />{renderPhotoLocationBadge(photo)}</div><input type="text" className="photo-remark-input" placeholder="Add photo remark..." value={photo.remark ?? ""} disabled={activeAudit.status === "submitted"} onChange={(e) => void updateCheckpointPhotoRemark(equipment.id, checkpoint, photoIndex, e.target.value)} /><button type="button" disabled={activeAudit.status === "submitted"} aria-label={`Remove photo ${photoIndex + 1}`} onClick={() => void removeCheckpointPhoto(equipment.id, checkpoint, photoIndex)}>Remove</button></div>)}</div>}<small className="photo-storage-note">Photos are compressed and saved locally with this checkpoint for offline use.</small></div>
                 </div>)}</div>}
                 <div className="equipment-save-row"><button type="button" className="secondary-button" disabled={activeAudit.status === "submitted"} onClick={() => setMessage(`${equipment.name}: equipment and checkpoint changes are saved on this device.`)}>Save equipment</button></div>
               </article>)}
@@ -1803,10 +1918,10 @@ export default function App() {
           {observationDraft && <form className="content-card observation-form" onSubmit={(event) => void handleCreateObservation(event)}>
             <div className="card-heading"><div><span className="card-kicker">{observationDraft.findingType === "NC" ? "NON-COMPLIANCE" : "OPPORTUNITY FOR IMPROVEMENT"}</span><h3>{observationDraft.observationId ? "Complete observation details" : `New ${observationDraft.findingType} observation`}</h3><p>{observationDraft.checkpointText}</p></div><button type="button" className="secondary-button" onClick={() => setObservationDraft(null)}>Cancel</button></div>
             <div className="form-grid observation-grid"><label>Observation title <span>*</span><input value={observationTitle} onChange={e => setObservationTitle(e.target.value)} required /></label><label>Severity<select value={observationSeverity} onChange={e => setObservationSeverity(e.target.value)}><option value="">Unclassified</option><option>Minor</option><option>Major</option><option>Critical</option></select></label><label>Responsible person<input value={observationResponsible} onChange={e => setObservationResponsible(e.target.value)} placeholder="Name or role" /></label><label>Target closure date<input type="date" value={observationTargetDate} onChange={e => setObservationTargetDate(e.target.value)} /></label><label>Actual closure date<input type="date" value={observationClosureDate} onChange={e => setObservationClosureDate(e.target.value)} /></label><label className="wide-field">Description<textarea value={observationDescription} onChange={e => setObservationDescription(e.target.value)} rows={3} placeholder="Describe the finding..." /></label><label className="wide-field">{observationDraft.findingType === "NC" ? "Corrective action / Action taken" : "Improvement action / Action taken"}<textarea value={observationAction} onChange={e => setObservationAction(e.target.value)} rows={3} placeholder="Describe action taken or planned..." /></label></div>
-            {(() => { const linked = observations.find(o => o.id === observationDraft.observationId); const checkpointPhotos = linked?.photos ?? []; return <div className="observation-photo-panel"><h4>Observation photos</h4><p>Inspection photos captured at this checkpoint appear here automatically.</p>{checkpointPhotos.length > 0 ? <div className="checkpoint-photo-grid">{checkpointPhotos.map((photo, index) => <div className="checkpoint-photo-item" key={`source-${index}`}><img src={photo} alt={`Checkpoint inspection ${index + 1}`} /><small>Inspection photo {index + 1}</small></div>)}</div> : <small>No checkpoint photos attached.</small>}<h4>Photos of action taken</h4><div className="photo-action-buttons"><button type="button" className="secondary-button photo-capture-button" onClick={() => void takeObservationActionPhoto()}>📷 Capture Action Photo</button><label className="secondary-button photo-capture-button">🖼️ Choose from Gallery<input className="photo-file-input" type="file" accept="image/*" multiple onChange={(event) => { const files = Array.from(event.currentTarget.files ?? []); files.forEach(file => void addObservationActionPhoto(file)); event.currentTarget.value = ""; }} /></label></div>{observationActionPhotos.length > 0 && <div className="checkpoint-photo-grid">{observationActionPhotos.map((photo, index) => <div className="checkpoint-photo-item" key={`action-${index}`}><img src={photo} alt={`Action taken photo ${index + 1}`} /><button type="button" onClick={() => setObservationActionPhotos(current => current.filter((_, i) => i !== index))}>Remove</button></div>)}</div>}</div>; })()}
+            {(() => { const linked = observations.find(o => o.id === observationDraft.observationId); const checkpointPhotos = linked?.photos ?? []; return <div className="observation-photo-panel"><h4>Observation photos</h4><p>Inspection photos captured at this checkpoint appear here automatically.</p>{checkpointPhotos.length > 0 ? <div className="checkpoint-photo-grid">{checkpointPhotos.map((photo, index) => <div className="checkpoint-photo-item" key={`source-${index}`}><div className="photo-thumb-wrap"><img src={photo.src} alt={`Checkpoint inspection ${index + 1}`} />{renderPhotoLocationBadge(photo)}</div><small>Inspection photo {index + 1}</small>{photo.remark && <small className="photo-remark-readonly">{photo.remark}</small>}</div>)}</div> : <small>No checkpoint photos attached.</small>}<h4>Photos of action taken</h4><div className="photo-action-buttons"><button type="button" className="secondary-button photo-capture-button" onClick={() => void takeObservationActionPhoto()}>📷 Capture Action Photo</button><label className="secondary-button photo-capture-button">🖼️ Choose from Gallery<input className="photo-file-input" type="file" accept="image/*" multiple onChange={(event) => { const files = Array.from(event.currentTarget.files ?? []); files.forEach(file => void addObservationActionPhoto(file)); event.currentTarget.value = ""; }} /></label></div>{observationActionPhotos.length > 0 && <div className="checkpoint-photo-grid">{observationActionPhotos.map((photo, index) => <div className="checkpoint-photo-item" key={`action-${index}`}><div className="photo-thumb-wrap"><img src={photo.src} alt={`Action taken photo ${index + 1}`} />{renderPhotoLocationBadge(photo)}</div><input type="text" className="photo-remark-input" placeholder="Add photo remark..." value={photo.remark ?? ""} onChange={(e) => setObservationActionPhotos((curr) => curr.map((item, i) => i === index ? { ...item, remark: e.target.value } : item))} /><button type="button" onClick={() => setObservationActionPhotos(current => current.filter((_, i) => i !== index))}>Remove</button></div>)}</div>}</div>; })()}
             <div className="form-actions"><button type="submit" className="primary-button">Save observation</button></div>
           </form>}
-          {observations.length === 0 ? <div className="empty-state large-empty"><div className="empty-icon"><Icon name="eye" /></div><h3>No observations yet</h3><p>Submit an audit with NC or OFI checkpoints to create observations here. Complete the follow-up details after submission.</p><button className="secondary-button" onClick={() => setSection("Audits")}>Go to audits <Icon name="arrow" /></button></div> : filteredObservations.length === 0 ? <div className="empty-state observation-no-results"><h3>No matching observations</h3><p>Try changing the search text or clearing one or more filters.</p><button type="button" className="secondary-button" onClick={() => { setObservationSearch(""); setObservationFindingFilter("ALL"); setObservationStatusFilter("all"); setObservationPlantFilter("all"); }}>Clear filters</button></div> : <div className="observation-list">{(() => { const plantGroups = new Map<string, LocalObservation[]>(); filteredObservations.forEach((o) => plantGroups.set(o.plantName || "Plant", [...(plantGroups.get(o.plantName || "Plant") ?? []), o])); return [...plantGroups.entries()].map(([plant, plantItems]) => { const auditGroups = new Map<string, LocalObservation[]>(); plantItems.forEach((o) => auditGroups.set(o.auditId, [...(auditGroups.get(o.auditId) ?? []), o])); return <details className="summary-observation-group observation-plant-group" key={plant} open><summary>{plant}<span>{plantItems.length} observation(s)</span></summary><div>{[...auditGroups.entries()].map(([auditId, auditItems]) => { return <details className="summary-observation-group" key={auditId}><summary>{auditItems[0]?.auditTitle || "Audit"}<span>{auditItems.length} observation(s)</span></summary><div>{auditItems.map((o) => <article className="content-card observation-row" key={o.id}><div className="observation-row-top"><span className={`finding-tag finding-${o.findingType.toLowerCase()}`}>{o.findingType}</span><span className={`observation-status status-${o.status}`}>{o.status}</span></div><h3>{o.title}</h3><p className="observation-meta">{o.checkpointText}</p>{o.description && <p>{o.description}</p>}<div className="observation-details"><span>Severity <b>{o.severity || "Unclassified"}</b></span><span>Responsible <b>{o.responsiblePerson || "Not assigned"}</b></span><span>Target date <b>{o.targetDate || "Not set"}</b></span></div>{o.actionText && <p><b>{o.findingType === "NC" ? "Corrective action / Action taken:" : "Improvement action / Action taken:"}</b> {o.actionText}</p>}{(o.photos?.length ?? 0) > 0 && <div className="observation-inline-photos"><b>Inspection photos</b><div className="checkpoint-photo-grid">{(o.photos ?? []).map((photo, index) => <div className="checkpoint-photo-item" key={`obs-${o.id}-${index}`}><img src={photo} alt={`Inspection photo ${index + 1}`} /></div>)}</div></div>}{(o.actionPhotos?.length ?? 0) > 0 && <div className="observation-inline-photos"><b>Action taken photos</b><div className="checkpoint-photo-grid">{(o.actionPhotos ?? []).map((photo, index) => <div className="checkpoint-photo-item" key={`obs-action-${o.id}-${index}`}><img src={photo} alt={`Action taken photo ${index + 1}`} /></div>)}</div></div>}<div className="observation-meta">{o.serverObservationId ? <span>Backend: {o.status.replace("_", " ")}</span> : <span>Local only{o.findingType === "OFI" ? " · awaiting audit sync" : " · awaiting audit sync"}</span>}{o.syncStatus === "error" && <span className="error-text">Sync issue: {o.syncError || "retry required"}</span>}</div><div className="form-actions"><button className="secondary-button" onClick={() => editObservation(o)}>Complete details</button>{o.serverObservationId && ["open", "in_progress", "rejected", "reopened"].includes(o.status) && <button className="primary-button" onClick={() => void submitObservationForReview(o)}>Submit for review</button>}</div></article>)}</div></details>; })}</div></details>; }); })()}</div>}
+          {observations.length === 0 ? <div className="empty-state large-empty"><div className="empty-icon"><Icon name="eye" /></div><h3>No observations yet</h3><p>Submit an audit with NC or OFI checkpoints to create observations here. Complete the follow-up details after submission.</p><button className="secondary-button" onClick={() => setSection("Audits")}>Go to audits <Icon name="arrow" /></button></div> : filteredObservations.length === 0 ? <div className="empty-state observation-no-results"><h3>No matching observations</h3><p>Try changing the search text or clearing one or more filters.</p><button type="button" className="secondary-button" onClick={() => { setObservationSearch(""); setObservationFindingFilter("ALL"); setObservationStatusFilter("all"); setObservationPlantFilter("all"); }}>Clear filters</button></div> : <div className="observation-list">{(() => { const plantGroups = new Map<string, LocalObservation[]>(); filteredObservations.forEach((o) => plantGroups.set(o.plantName || "Plant", [...(plantGroups.get(o.plantName || "Plant") ?? []), o])); return [...plantGroups.entries()].map(([plant, plantItems]) => { const auditGroups = new Map<string, LocalObservation[]>(); plantItems.forEach((o) => auditGroups.set(o.auditId, [...(auditGroups.get(o.auditId) ?? []), o])); return <details className="summary-observation-group observation-plant-group" key={plant} open><summary>{plant}<span>{plantItems.length} observation(s)</span></summary><div>{[...auditGroups.entries()].map(([auditId, auditItems]) => { return <details className="summary-observation-group" key={auditId}><summary>{auditItems[0]?.auditTitle || "Audit"}<span>{auditItems.length} observation(s)</span></summary><div>{auditItems.map((o) => <article className="content-card observation-row" key={o.id}><div className="observation-row-top"><span className={`finding-tag finding-${o.findingType.toLowerCase()}`}>{o.findingType}</span><span className={`observation-status status-${o.status}`}>{o.status}</span></div><h3>{o.title}</h3><p className="observation-meta">{o.checkpointText}</p>{o.description && <p>{o.description}</p>}<div className="observation-details"><span>Severity <b>{o.severity || "Unclassified"}</b></span><span>Responsible <b>{o.responsiblePerson || "Not assigned"}</b></span><span>Target date <b>{o.targetDate || "Not set"}</b></span></div>{o.actionText && <p><b>{o.findingType === "NC" ? "Corrective action / Action taken:" : "Improvement action / Action taken:"}</b> {o.actionText}</p>}{(o.photos?.length ?? 0) > 0 && <div className="observation-inline-photos"><b>Inspection photos</b><div className="checkpoint-photo-grid">{(o.photos ?? []).map((photo, index) => <div className="checkpoint-photo-item" key={`obs-${o.id}-${index}`}><div className="photo-thumb-wrap"><img src={photo.src} alt={`Inspection photo ${index + 1}`} />{renderPhotoLocationBadge(photo)}</div>{photo.remark && <small className="photo-remark-readonly">{photo.remark}</small>}</div>)}</div></div>}{(o.actionPhotos?.length ?? 0) > 0 && <div className="observation-inline-photos"><b>Action taken photos</b><div className="checkpoint-photo-grid">{(o.actionPhotos ?? []).map((photo, index) => <div className="checkpoint-photo-item" key={`obs-action-${o.id}-${index}`}><div className="photo-thumb-wrap"><img src={photo.src} alt={`Action taken photo ${index + 1}`} />{renderPhotoLocationBadge(photo)}</div>{photo.remark && <small className="photo-remark-readonly">{photo.remark}</small>}</div>)}</div></div>}<div className="observation-meta">{o.serverObservationId ? <span>Backend: {o.status.replace("_", " ")}</span> : <span>Local only{o.findingType === "OFI" ? " · awaiting audit sync" : " · awaiting audit sync"}</span>}{o.syncStatus === "error" && <span className="error-text">Sync issue: {o.syncError || "retry required"}</span>}</div><div className="form-actions"><button className="secondary-button" onClick={() => editObservation(o)}>Complete details</button>{o.serverObservationId && ["open", "in_progress", "rejected", "reopened"].includes(o.status) && <button className="primary-button" onClick={() => void submitObservationForReview(o)}>Submit for review</button>}</div></article>)}</div></details>; })}</div></details>; }); })()}</div>}
         </div>}
         {section === "Reports" && <div className="page-content">
           <div className="section-heading report-heading">

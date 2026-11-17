@@ -267,7 +267,10 @@ async function uploadWithRetry<T>(fn: () => Promise<{ response: Response; body: 
 }
 
 export async function syncAuditPhoto(
-  baseUrl: string, token: string, auditId: string, photoId: string, fields: { question_id: number; asset_ref: string; asset_id?: string; dataUrl: string; captured_at?: string },
+  baseUrl: string, token: string, auditId: string, photoId: string, fields: {
+    question_id: number; asset_ref: string; asset_id?: string; dataUrl: string;
+    captured_at?: string; latitude?: number | null; longitude?: number | null; gps_accuracy?: number | null; remark?: string;
+  },
 ): Promise<{ ok: boolean; photo_id?: string; duplicate?: boolean }> {
   const base = normalizeBaseUrl(baseUrl);
   if (!token.trim()) throw new Error("Sign in before uploading audit photos.");
@@ -284,6 +287,10 @@ export async function syncAuditPhoto(
     form.append("asset_ref", fields.asset_ref);
     if (fields.asset_id) form.append("asset_id", fields.asset_id);
     form.append("captured_at", capturedAt);
+    if (typeof fields.latitude === "number" && Number.isFinite(fields.latitude)) form.append("latitude", String(fields.latitude));
+    if (typeof fields.longitude === "number" && Number.isFinite(fields.longitude)) form.append("longitude", String(fields.longitude));
+    if (typeof fields.gps_accuracy === "number" && Number.isFinite(fields.gps_accuracy)) form.append("gps_accuracy", String(fields.gps_accuracy));
+    if (fields.remark?.trim()) form.append("remark", fields.remark.trim());
     form.append("file", blob, `${photoId}.${extension}`);
     const response = await fetchWithTimeout(`${base}/audits/${encodeURIComponent(auditId)}/photos/${encodeURIComponent(photoId)}`, {
       method: "POST", headers: { Accept: "application/json", Authorization: `Bearer ${token}` }, body: form,
@@ -380,6 +387,7 @@ export async function updateServerObservationAction(
 
 export async function uploadServerObservationPhoto(
   baseUrl: string, token: string, observationId: string, photoId: string, dataUrl: string,
+  meta?: { captured_at?: string; latitude?: number | null; longitude?: number | null; gps_accuracy?: number | null },
 ): Promise<{ ok: boolean; photo_id: string; duplicate?: boolean }> {
   const base = normalizeBaseUrl(baseUrl);
   if (!token.trim()) throw new Error("Sign in before uploading closure evidence.");
@@ -389,7 +397,10 @@ export async function uploadServerObservationPhoto(
   const form = new FormData();
   const extension = blob.type.includes("png") ? "png" : blob.type.includes("webp") ? "webp" : blob.type.includes("gif") ? "gif" : "jpg";
   form.append("file", blob, `${photoId}.${extension}`);
-  form.append(`photo_captured_at_${photoId}`, new Date().toISOString());
+  form.append(`photo_captured_at_${photoId}`, meta?.captured_at || new Date().toISOString());
+  if (typeof meta?.latitude === "number" && Number.isFinite(meta.latitude)) form.append(`photo_latitude_${photoId}`, String(meta.latitude));
+  if (typeof meta?.longitude === "number" && Number.isFinite(meta.longitude)) form.append(`photo_longitude_${photoId}`, String(meta.longitude));
+  if (typeof meta?.gps_accuracy === "number" && Number.isFinite(meta.gps_accuracy)) form.append(`photo_accuracy_${photoId}`, String(meta.gps_accuracy));
   const response = await fetch(`${base}/observations/${encodeURIComponent(observationId)}/closure-photos/${encodeURIComponent(photoId)}`, {
     method: "POST", headers: { Accept: "application/json", Authorization: `Bearer ${token}` }, body: form,
   });

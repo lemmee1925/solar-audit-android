@@ -4,6 +4,39 @@ import { CapacitorSQLite, SQLiteConnection, type SQLiteDBConnection } from "@cap
 
 const CAPFS_PREFIX = "capfs:";
 
+export type PhotoItem = {
+  src: string;
+  remark?: string;
+  latitude?: number | null;
+  longitude?: number | null;
+  accuracy?: number | null;
+  capturedAt?: string | null;
+};
+
+export function normalizePhotoEntry(entry: unknown): PhotoItem | null {
+  if (typeof entry === "string") {
+    const src = entry.trim();
+    return src ? { src } : null;
+  }
+  if (entry && typeof entry === "object") {
+    const obj = entry as Record<string, unknown>;
+    const src = String(obj.src ?? "").trim();
+    if (!src) return null;
+    const lat = typeof obj.latitude === "number" && Number.isFinite(obj.latitude) ? obj.latitude : null;
+    const lon = typeof obj.longitude === "number" && Number.isFinite(obj.longitude) ? obj.longitude : null;
+    const acc = typeof obj.accuracy === "number" && Number.isFinite(obj.accuracy) ? obj.accuracy : null;
+    return {
+      src,
+      remark: obj.remark != null ? String(obj.remark) : "",
+      latitude: lat,
+      longitude: lon,
+      accuracy: acc,
+      capturedAt: obj.capturedAt != null ? String(obj.capturedAt) : null,
+    };
+  }
+  return null;
+}
+
 function photoDigest(input: string): string {
   let h1 = 0x811c9dc5;
   let h2 = 0x9e3779b9;
@@ -15,18 +48,15 @@ function photoDigest(input: string): string {
   return `${h1.toString(16).padStart(8, "0")}${h2.toString(16).padStart(8, "0")}_${input.length}`;
 }
 
-async function persistPhotosToFilesystem(photos: string[], scopeId: string): Promise<string[]> {
-  if (!Capacitor.isNativePlatform()) return photos;
-  const out: string[] = [];
-  for (const item of photos ?? []) {
-    if (!item) continue;
-    if (item.startsWith(CAPFS_PREFIX)) {
-      out.push(item);
-      continue;
-    }
-    if (item.startsWith("data:image/")) {
-      const commaIndex = item.indexOf(",");
-      const base64Data = commaIndex >= 0 ? item.slice(commaIndex + 1) : item;
+async function persistPhotosToFilesystem(photos: Array<PhotoItem | string>, scopeId: string): Promise<PhotoItem[]> {
+  const normalized = (photos ?? []).map(normalizePhotoEntry).filter((p): p is PhotoItem => p !== null);
+  if (!Capacitor.isNativePlatform()) return normalized;
+  const out: PhotoItem[] = [];
+  for (const item of normalized) {
+    let nextSrc = item.src;
+    if (!nextSrc.startsWith(CAPFS_PREFIX) && nextSrc.startsWith("data:image/")) {
+      const commaIndex = nextSrc.indexOf(",");
+      const base64Data = commaIndex >= 0 ? nextSrc.slice(commaIndex + 1) : nextSrc;
       const relPath = `audit_photos/${scopeId}_${photoDigest(base64Data)}.jpg`;
       try {
         await Filesystem.writeFile({
@@ -35,13 +65,12 @@ async function persistPhotosToFilesystem(photos: string[], scopeId: string): Pro
           directory: Directory.Data,
           recursive: true,
         });
-        out.push(`${CAPFS_PREFIX}${relPath}`);
-        continue;
+        nextSrc = `${CAPFS_PREFIX}${relPath}`;
       } catch (err) {
         console.warn("[Solar Audit] Filesystem photo write fallback to inline:", err);
       }
     }
-    out.push(item);
+    out.push({ ...item, src: nextSrc });
   }
   return out;
 }
@@ -61,23 +90,25 @@ export async function resolvePhotoRef(entry: string): Promise<string> {
   return dataStr.startsWith("data:image/") ? dataStr : `data:image/jpeg;base64,${dataStr}`;
 }
 
-async function resolvePhotosFromFilesystem(rawJson: unknown): Promise<string[]> {
-  let parsed: string[] = [];
+async function resolvePhotosFromFilesystem(rawJson: unknown): Promise<PhotoItem[]> {
+  let parsed: PhotoItem[] = [];
   try {
     const val = JSON.parse(String(rawJson ?? "[]"));
-    if (Array.isArray(val)) parsed = val.map((x) => String(x ?? "")).filter(Boolean);
+    if (Array.isArray(val)) {
+      parsed = val.map(normalizePhotoEntry).filter((p): p is PhotoItem => p !== null);
+    }
   } catch {
     return [];
   }
   if (!Capacitor.isNativePlatform()) return parsed;
-  const resolved: string[] = [];
+  const resolved: PhotoItem[] = [];
   for (const entry of parsed) {
-    if (entry.startsWith(CAPFS_PREFIX)) {
+    if (entry.src.startsWith(CAPFS_PREFIX)) {
       try {
-        const img = await resolvePhotoRef(entry);
-        if (img) resolved.push(img);
+        const img = await resolvePhotoRef(entry.src);
+        if (img) resolved.push({ ...entry, src: img });
       } catch (err) {
-        console.warn("[Solar Audit] Could not read stored photo file:", entry, err);
+        console.warn("[Solar Audit] Could not read stored photo file:", entry.src, err);
       }
     } else {
       resolved.push(entry);
@@ -705,7 +736,7 @@ export type AuditCheckpoint = {
   checkpointText: string;
   result: "C" | "NC" | "NA" | "OFI";
   remarks: string;
-  photos: string[];
+  photos: PhotoItem[];
   updatedAt: string;
 };
 export type AuditEquipment = {
@@ -725,10 +756,10 @@ function readBrowserExecution(): BrowserExecution {
   } catch { return {}; }
 }
 
-function parsePhotoRefArray(rawJson: unknown): string[] {
+function parsePhotoRefArray(rawJson: unknown): PhotoItem[] {
   try {
     const val = JSON.parse(String(rawJson ?? "[]"));
-    return Array.isArray(val) ? val.map((x) => String(x ?? "")).filter(Boolean) : [];
+    return Array.isArray(val) ? val.map(normalizePhotoEntry).filter((p): p is PhotoItem => p !== null) : [];
   } catch {
     return [];
   }
@@ -878,7 +909,7 @@ export type LocalObservation = {
   id: string; auditId: string; auditTitle: string; plantName: string; checkpointId: string | null;
   checkpointText: string; findingType: FindingType; title: string; description: string; severity: string;
   responsiblePerson: string; actionText: string; status: ObservationStatus; targetDate: string; closureDate: string;
-  createdAt: string; updatedAt: string; photos: string[]; actionPhotos: string[];
+  createdAt: string; updatedAt: string; photos: PhotoItem[]; actionPhotos: PhotoItem[];
   equipmentName?: string; equipmentType?: string; serverObservationId?: string; syncStatus?: "local" | "synced" | "pending" | "error"; syncError?: string;
 };
 const OBSERVATIONS_KEY = "solar-audit-observations-v1";
@@ -988,10 +1019,11 @@ export async function markObservationSyncError(id: string, error: string): Promi
   await db.run("UPDATE observations SET sync_status='error', sync_error=?, updated_at=? WHERE id=?", [error.slice(0, 1000), new Date().toISOString(), id]);
 }
 
-export async function saveObservationActionPhotos(id: string, photos: string[]): Promise<void> {
+export async function saveObservationActionPhotos(id: string, photos: Array<PhotoItem | string>): Promise<void> {
+  const normalized = (photos ?? []).map(normalizePhotoEntry).filter((p): p is PhotoItem => p !== null);
   const db = await (dbPromise ??= openDatabase());
-  if (!db) { const items = readBrowserObservations().map(o => o.id === id ? { ...o, actionPhotos: photos, syncStatus: "pending" as const, updatedAt: new Date().toISOString() } : o); localStorage.setItem(OBSERVATIONS_KEY, JSON.stringify(items)); return; }
-  const storedPhotos = await persistPhotosToFilesystem(photos ?? [], `obs_${id}`);
+  if (!db) { const items = readBrowserObservations().map(o => o.id === id ? { ...o, actionPhotos: normalized, syncStatus: "pending" as const, updatedAt: new Date().toISOString() } : o); localStorage.setItem(OBSERVATIONS_KEY, JSON.stringify(items)); return; }
+  const storedPhotos = await persistPhotosToFilesystem(normalized, `obs_${id}`);
   await db.run("UPDATE observations SET action_photos_json=?, sync_status='pending', updated_at=? WHERE id=?", [JSON.stringify(storedPhotos), new Date().toISOString(), id]);
 }
 
