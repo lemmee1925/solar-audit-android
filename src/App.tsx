@@ -4,7 +4,7 @@ import { Filesystem, Directory } from "@capacitor/filesystem";
 import { Share } from "@capacitor/share";
 import "./styles.css";
 import { TECHNICAL_CHECKLISTS, TECHNICAL_CATEGORIES, SAFETY_CHECKLIST, CIVIL_CHECKLIST } from "./checklistLibrary";
-import { addAuditCheckpoint, addAuditEquipment, clearWorkspace, createAudit, initializeLocalDatabase, loadAuditExecution, loadAuditExecutionPhotoRefs, resolvePhotoRef, loadAudits, loadWorkspace, saveWorkspace, updateAuditCheckpoint, type AuditCheckpoint, type AuditEquipment, type AuditType, type LocalAudit, type LocalObservation, type FindingType, type PhotoItem, loadObservations, createObservation, deleteObservation, markAuditSubmitted, updateAuditType, updateObservationDetails, saveObservationActionPhotos, linkObservationToServer, markObservationSyncError, cacheServerReferenceData, loadCachedServerReferenceData, mergeServerPlantsIntoWorkspace, saveAuditSyncAcknowledgement, reconcileServerAuditStatuses } from "./db";
+import { addAuditCheckpoint, addAuditEquipment, clearWorkspace, createAudit, initializeLocalDatabase, loadAuditExecution, loadAuditExecutionPhotoRefs, resolvePhotoRef, loadAudits, loadWorkspace, saveWorkspace, updateAuditCheckpoint, type AuditCheckpoint, type AuditEquipment, type AuditType, type AssignedUserScope, type LocalAudit, type LocalObservation, type FindingType, type PhotoItem, loadObservations, createObservation, deleteObservation, markAuditSubmitted, updateAuditType, updateObservationDetails, saveObservationActionPhotos, linkObservationToServer, markObservationSyncError, cacheServerReferenceData, loadCachedServerReferenceData, mergeServerPlantsIntoWorkspace, saveAuditSyncAcknowledgement, reconcileServerAuditStatuses } from "./db";
 import { authenticateAndBootstrap, downloadSiteReferenceData, createServerPlant, createServerAsset, renameServerAsset, deleteServerAsset, getServerPlantSpecs, saveServerPlantSpecs, syncAuditManifest, syncAuditPhoto, completeServerAudit, fetchServerAuditStatuses, fetchServerObservations, saveServerObservationDetails, updateServerObservationAction, uploadServerObservationPhoto, type MobileBootstrap, type AuditManifestPayload } from "./serverApi";
 
 type PlantEquipment = {
@@ -30,6 +30,7 @@ type Workspace = {
   siteName: string;
   siteLocation: string;
   plants: Plant[];
+  assignedUser?: AssignedUserScope;
 };
 
 type Section = "Dashboard" | "Sites & Plants" | "Audits" | "Observations" | "Reports" | "Settings";
@@ -161,9 +162,6 @@ async function photoFileToDataUrl(file: File): Promise<string> {
 export default function App() {
   const [workspace, setWorkspace] = useState<Workspace | null>(() => readWorkspace());
   const [section, setSection] = useState<Section>("Dashboard");
-  const [setupOrg, setSetupOrg] = useState("");
-  const [setupSite, setSetupSite] = useState("");
-  const [setupLocation, setSetupLocation] = useState("");
   const [plantName, setPlantName] = useState("");
   const [plantLocation, setPlantLocation] = useState("");
   const [plantCapacity, setPlantCapacity] = useState("");
@@ -602,7 +600,40 @@ export default function App() {
   }
 
   const hasWorkspace = Boolean(workspace);
-  const plantsCount = workspace?.plants.length ?? 0;
+  const assignedUser = workspace?.assignedUser;
+  const isAdminUser = !assignedUser || ["site_admin", "admin"].includes(String(assignedUser.role ?? "").toLowerCase());
+  const allowedServerPlantIds = useMemo(
+    () => new Set((assignedUser?.assignedServerPlantIds ?? []).map((id) => String(id))),
+    [assignedUser],
+  );
+  const visiblePlants = useMemo(() => {
+    const allPlants = workspace?.plants ?? [];
+    if (!assignedUser || isAdminUser) return allPlants;
+    return allPlants.filter((plant) => plant.serverPlantId && allowedServerPlantIds.has(String(plant.serverPlantId)));
+  }, [workspace, assignedUser, isAdminUser, allowedServerPlantIds]);
+  const visibleAudits = useMemo(() => {
+    if (!assignedUser || isAdminUser) return audits;
+    const plantIds = new Set(visiblePlants.map((p) => p.id));
+    const serverIds = new Set(visiblePlants.map((p) => String(p.serverPlantId ?? "")).filter(Boolean));
+    return audits.filter((audit) => {
+      if (plantIds.has(audit.plantId)) return true;
+      if (audit.plantId.startsWith("server-plant:")) {
+        const parts = audit.plantId.split(":");
+        return parts.length >= 3 && serverIds.has(parts[2]);
+      }
+      return false;
+    });
+  }, [audits, assignedUser, isAdminUser, visiblePlants]);
+  const visibleObservations = useMemo(() => {
+    if (!assignedUser || isAdminUser) return observations;
+    const auditIds = new Set(visibleAudits.map((a) => a.id));
+    const plantNames = new Set(visiblePlants.map((p) => p.name.trim().toLowerCase()));
+    return observations.filter((obs) =>
+      auditIds.has(obs.auditId)
+      || (obs.plantName ? plantNames.has(obs.plantName.trim().toLowerCase()) : false),
+    );
+  }, [observations, assignedUser, isAdminUser, visibleAudits, visiblePlants]);
+  const plantsCount = visiblePlants.length;
   const navItems: { label: Section; icon: string }[] = [
     { label: "Dashboard", icon: "grid" },
     { label: "Sites & Plants", icon: "site" },
@@ -611,19 +642,6 @@ export default function App() {
     { label: "Reports", icon: "report" },
     { label: "Settings", icon: "settings" },
   ];
-
-  function createWorkspace(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!setupOrg.trim() || !setupSite.trim()) return;
-    setWorkspace({
-      organizationName: setupOrg.trim(),
-      siteName: setupSite.trim(),
-      siteLocation: setupLocation.trim(),
-      plants: [],
-    });
-    setSection("Dashboard");
-    setMessage("Workspace created and saved on this device.");
-  }
 
   function addEquipmentPlan() {
     if (!plantEquipmentCategory) {
@@ -1485,32 +1503,80 @@ export default function App() {
     event.preventDefault();
     if (serverBusy) return;
     setServerBusy(true);
-    setServerMessage("Connecting and checking reference data…");
+    setServerMessage("Signing in and loading your assigned plant data…");
     setServerToken("");
     setServerBootstrap(null);
     try {
       const result = await authenticateAndBootstrap(serverBaseUrl, serverUsername, serverPassword);
-      // Keep the short-lived bearer token in memory only for this diagnostic stage.
+      // Keep the short-lived bearer token in memory only.
       // It is deliberately not written to SQLite or localStorage.
       setServerToken(result.token);
       setServerBootstrap(result.bootstrap);
       setServerPassword("");
-      const connectedSiteId = result.bootstrap.sites?.[0]?.id;
+      const connectedSiteId = result.bootstrap.sites?.[0]?.id || result.login.site?.id || "";
+      const siteName = result.login.site?.name || result.bootstrap.sites[0]?.name || "CleanMax Solar Site";
+      let latestReference: any = null;
       let typeCount = 0;
       if (connectedSiteId) {
         try {
-          const latestReference = await downloadSiteReferenceData(serverBaseUrl, result.token, connectedSiteId);
+          latestReference = await downloadSiteReferenceData(serverBaseUrl, result.token, connectedSiteId);
           await cacheServerReferenceData(latestReference);
           const types = Array.isArray(latestReference?.data?.asset_types) ? latestReference.data.asset_types : [];
           setServerAssetTypes(types.filter((item: any) => item && item.name).map((item: any) => ({ id: item.id, name: String(item.name).trim() })).sort((a: any, b: any) => a.name.localeCompare(b.name)));
           typeCount = types.length;
         } catch (referenceError) {
-          console.warn("[Solar Audit] Could not refresh backend equipment taxonomy during sign-in; using last cached taxonomy.", referenceError);
+          console.warn("[Solar Audit] Could not refresh backend reference data during sign-in.", referenceError);
         }
       }
-      const siteName = result.login.site?.name || result.bootstrap.sites[0]?.name || "configured site";
-      const plantCount = result.bootstrap.sites.reduce((count, site) => count + (site.plants?.length ?? 0), 0);
-      setServerMessage(`Connected as ${result.login.user.username} to ${siteName}. Bootstrap succeeded (${plantCount} plant(s)). ${typeCount ? `${typeCount} backend equipment types loaded; category lists now match the backend.` : "Using previously cached equipment types if available; download reference data to refresh them."} No local audit data was uploaded or changed.`);
+
+      const bootstrapPlants = Array.isArray(result.bootstrap.sites?.[0]?.plants) ? result.bootstrap.sites[0].plants : [];
+      const refPlants = Array.isArray(latestReference?.data?.plants) ? latestReference.data.plants : bootstrapPlants;
+      const assignedServerPlantIds = refPlants.map((p: any) => String(p?.id ?? "")).filter(Boolean);
+      const assignedUserScope: AssignedUserScope = {
+        id: String(result.login.user.id),
+        username: result.login.user.username,
+        fullName: result.login.user.full_name,
+        role: result.login.user.role,
+        siteId: connectedSiteId,
+        assignedServerPlantIds,
+      };
+
+      const isSameUser = Boolean(workspace && workspace.assignedUser?.id === assignedUserScope.id);
+      const baseWorkspace: Workspace = isSameUser && workspace
+        ? { ...workspace, siteName: workspace.siteName || siteName, assignedUser: assignedUserScope }
+        : {
+            organizationName: "CleanMax Solar",
+            siteName,
+            siteLocation: "",
+            plants: [],
+            assignedUser: assignedUserScope,
+          };
+
+      const referencePayload = latestReference ?? {
+        data: {
+          site_id: connectedSiteId,
+          plants: bootstrapPlants,
+          assets: [],
+          asset_types: [],
+        },
+      };
+      const mergedWorkspace = connectedSiteId
+        ? await mergeServerPlantsIntoWorkspace(baseWorkspace, referencePayload)
+        : baseWorkspace;
+      const finalWorkspace: Workspace = { ...mergedWorkspace, assignedUser: assignedUserScope };
+      await saveWorkspace(finalWorkspace);
+      setWorkspace(finalWorkspace);
+      if (!isSameUser) {
+        setActiveAudit(null);
+        setSummaryAudit(null);
+        setObservationDraft(null);
+        setSection("Dashboard");
+      }
+
+      const plantCount = assignedServerPlantIds.length;
+      setServerMessage(
+        `Signed in as ${result.login.user.full_name || result.login.user.username} (${siteName}). Loaded ${plantCount} assigned plant(s)${typeCount ? ` and ${typeCount} equipment types` : ""}.`,
+      );
     } catch (error) {
       const text = error instanceof Error ? error.message : "Could not connect to the server.";
       setServerMessage(text);
@@ -1734,13 +1800,17 @@ export default function App() {
   }
 
   function resetWorkspace() {
-    if (!window.confirm("Reset this local workspace? This removes the organization, site and plant details stored on this device.")) return;
+    if (!window.confirm("Sign out and reset this local workspace? You will need to sign in again to access plant data.")) return;
+    setServerToken("");
+    setServerBootstrap(null);
+    setServerPassword("");
+    setServerMessage("");
+    setActiveAudit(null);
+    setSummaryAudit(null);
+    setObservationDraft(null);
     setWorkspace(null);
-    setSetupOrg("");
-    setSetupSite("");
-    setSetupLocation("");
     setSection("Dashboard");
-    setMessage("Local workspace reset.");
+    setMessage("Signed out and local workspace reset.");
   }
 
   const pageTitle = useMemo(() => section, [section]);
@@ -1755,28 +1825,29 @@ export default function App() {
         <div className="setup-brand"><div className="brand-mark"><Icon name="sun" /></div><div><span className="eyebrow">FIELD OPERATIONS</span><h1>Solar Audit<span> Mobile</span></h1></div></div>
         <div className="setup-layout">
           <section className="setup-intro">
-            <span className="pill"><span className="status-dot" /> NEW WORKSPACE</span>
-            <h2>A clean start for every site audit.</h2>
-            <p>Set up your organization and first site. You choose what gets added—nothing is preloaded.</p>
-            <div className="setup-points"><div><span>01</span><div><b>Create your workspace</b><small>Enter your organization and site details.</small></div></div><div><span>02</span><div><b>Add your plants</b><small>Build your plant list when you're ready.</small></div></div><div><span>03</span><div><b>Prepare for audits</b><small>Audit capture and server sync will be connected in the next stages.</small></div></div></div>
+            <span className="pill"><span className="status-dot" /> PLANT ACCESS LOGIN</span>
+            <h2>Sign in to load your assigned plant.</h2>
+            <p>Each user account is scoped to its assigned solar plant(s). Sign in with your plant credentials to download your plant&apos;s equipment, checklists, and audit workspace.</p>
+            <div className="setup-points"><div><span>01</span><div><b>Authenticate</b><small>Enter your assigned username and password.</small></div></div><div><span>02</span><div><b>Plant-scoped data</b><small>Only the plant(s) assigned to your credentials are loaded.</small></div></div><div><span>03</span><div><b>Work offline in the field</b><small>Conduct audits, capture geo-tagged photos, and sync when online.</small></div></div></div>
           </section>
-          <form className="setup-card" onSubmit={createWorkspace}>
-            <div className="card-kicker">FIRST-TIME SETUP</div><h3>Set up your workspace</h3><p className="muted">Start with the basics. You can change these later.</p>
-            <label>Organization name <span>*</span><input value={setupOrg} onChange={(e) => setSetupOrg(e.target.value)} placeholder="Enter organization name" required /></label>
-            <label>First site name <span>*</span><input value={setupSite} onChange={(e) => setSetupSite(e.target.value)} placeholder="Enter site name" required /></label>
-            <label>Site location <small>OPTIONAL</small><input value={setupLocation} onChange={(e) => setSetupLocation(e.target.value)} placeholder="City, state or site address" /></label>
-            <button className="primary-button full-button" type="submit">Create workspace <Icon name="arrow" /></button>
-            <div className="local-note"><Icon name="cloud" /><span><b>Device-only setup</b><br />These details are saved in this app on this device. Server backup and multi-user access are not connected yet.</span></div>
+          <form className="setup-card" onSubmit={(event) => void connectServer(event)}>
+            <div className="card-kicker">SIGN IN REQUIRED</div><h3>Sign in to Solar Audit</h3><p className="muted">Connect to your CleanMax Solar Audit server.</p>
+            <label>Native API base URL <span>*</span><input type="url" value={serverBaseUrl} onChange={(e) => setServerBaseUrl(e.target.value)} placeholder="http://10.0.2.2:5010/api/mobile/v1" required autoCapitalize="none" autoCorrect="off" /></label>
+            <label>Username <span>*</span><input value={serverUsername} onChange={(e) => setServerUsername(e.target.value)} placeholder="Enter your plant username" autoComplete="username" autoCapitalize="none" required /></label>
+            <label>Password <span>*</span><input type="password" value={serverPassword} onChange={(e) => setServerPassword(e.target.value)} placeholder="Enter password" autoComplete="current-password" required /></label>
+            {serverMessage && <div className={`server-result ${serverBusy ? "pending" : ""}`} role="status">{serverMessage}</div>}
+            <button className="primary-button full-button" type="submit" disabled={serverBusy}>{serverBusy ? "Signing in…" : "Sign in & load plant data"} <Icon name="arrow" /></button>
+            <div className="local-note"><Icon name="cloud" /><span><b>Plant-scoped security</b><br />Your password is never stored on this device. Only plants assigned to your account are shown.</span></div>
           </form>
         </div>
-        <footer className="setup-footer">SOLAR AUDIT MOBILE <span>•</span> FRESH WORKSPACE</footer>
+        <footer className="setup-footer">SOLAR AUDIT MOBILE <span>•</span> PLANT-SCOPED ACCESS</footer>
       </main>
     );
   }
 
   const current = workspace as Workspace;
-  const observationPlants = [...new Set(observations.map((o) => o.plantName || "Plant"))].sort((a, b) => a.localeCompare(b));
-  const filteredObservations = observations.filter((o) => {
+  const observationPlants = [...new Set(visibleObservations.map((o) => o.plantName || "Plant"))].sort((a, b) => a.localeCompare(b));
+  const filteredObservations = visibleObservations.filter((o) => {
     const query = observationSearch.trim().toLowerCase();
     const matchesSearch = !query || [o.title, o.checkpointText, o.description, o.auditTitle, o.plantName, o.responsiblePerson]
       .some((value) => String(value ?? "").toLowerCase().includes(query));
@@ -1795,9 +1866,9 @@ export default function App() {
       <aside className="sidebar">
         <div className="sidebar-brand"><div className="brand-mark"><Icon name="sun" /></div><div><strong>Solar Audit</strong><small>Mobile workspace</small></div></div>
         <div className="workspace-label">WORKSPACE</div>
-        <div className="workspace-mini"><div className="workspace-avatar">{current.organizationName.slice(0, 1).toUpperCase()}</div><div className="workspace-copy"><b>{current.organizationName}</b><small>{current.siteName}</small></div></div>
+        <div className="workspace-mini"><div className="workspace-avatar">{(assignedUser?.fullName || assignedUser?.username || current.organizationName).slice(0, 1).toUpperCase()}</div><div className="workspace-copy"><b>{assignedUser?.fullName || assignedUser?.username || current.organizationName}</b><small>{visiblePlants.length === 1 ? visiblePlants[0].name : current.siteName}</small></div></div>
         <nav className="side-nav" aria-label="Main navigation">
-          {navItems.map((item) => <button key={item.label} className={section === item.label ? "nav-item active" : "nav-item"} onClick={() => { setSection(item.label); setMessage(""); }}><Icon name={item.icon} /><span>{item.label}</span>{item.label === "Audits" && <em>{audits.length}</em>}</button>)}
+          {navItems.map((item) => <button key={item.label} className={section === item.label ? "nav-item active" : "nav-item"} onClick={() => { setSection(item.label); setMessage(""); }}><Icon name={item.icon} /><span>{item.label}</span>{item.label === "Audits" && <em>{visibleAudits.length}</em>}</button>)}
         </nav>
         <div className="sidebar-bottom"><div className="sync-mini"><span className="status-dot green" /><div><b>On-device workspace</b><small>Offline-ready data storage</small></div></div><small className="version-label">Solar Audit Mobile</small></div>
       </aside>
@@ -1813,13 +1884,13 @@ export default function App() {
           </section>
           <div className="dashboard-section-title"><div><span className="card-kicker">AT A GLANCE</span><h2>Site overview</h2><p>Your audit activity on this device.</p></div><span className="live-tag"><span className="status-dot green" /> LIVE</span></div>
           <div className="metric-grid dashboard-metrics">
-            <button className="metric-card metric-action" onClick={() => setSection("Sites & Plants")}><div className="metric-top"><span>Registered plants</span><div className="metric-icon"><Icon name="plant" /></div></div><strong>{plantsCount}</strong><small>View plant register <Icon name="arrow" /></small></button>
-            <button className="metric-card metric-action" onClick={() => setSection("Audits")}><div className="metric-top"><span>Total audits</span><div className="metric-icon"><Icon name="audit" /></div></div><strong>{audits.length}</strong><small>View audit register <Icon name="arrow" /></small></button>
-            <button className="metric-card metric-action" onClick={() => setSection("Observations")}><div className="metric-top"><span>Open observations</span><div className="metric-icon"><Icon name="eye" /></div></div><strong>{observations.filter((o) => o.status !== "closed").length}</strong><small>NC and OFI findings</small></button>
-            <button className="metric-card metric-action" onClick={() => setSection("Reports")}><div className="metric-top"><span>Audit PDFs available</span><div className="metric-icon"><Icon name="report" /></div></div><strong>{audits.length}</strong><small>Generate audit PDFs</small></button>
+            <button className="metric-card metric-action" onClick={() => setSection("Sites & Plants")}><div className="metric-top"><span>Assigned plants</span><div className="metric-icon"><Icon name="plant" /></div></div><strong>{plantsCount}</strong><small>View plant register <Icon name="arrow" /></small></button>
+            <button className="metric-card metric-action" onClick={() => setSection("Audits")}><div className="metric-top"><span>Total audits</span><div className="metric-icon"><Icon name="audit" /></div></div><strong>{visibleAudits.length}</strong><small>View audit register <Icon name="arrow" /></small></button>
+            <button className="metric-card metric-action" onClick={() => setSection("Observations")}><div className="metric-top"><span>Open observations</span><div className="metric-icon"><Icon name="eye" /></div></div><strong>{visibleObservations.filter((o) => o.status !== "closed").length}</strong><small>NC and OFI findings</small></button>
+            <button className="metric-card metric-action" onClick={() => setSection("Reports")}><div className="metric-top"><span>Audit PDFs available</span><div className="metric-icon"><Icon name="report" /></div></div><strong>{visibleAudits.length}</strong><small>Generate audit PDFs</small></button>
           </div>
           <section className="dashboard-quick-actions"><div className="dashboard-section-title compact"><div><span className="card-kicker">SHORTCUTS</span><h2>Quick actions</h2></div></div><div className="quick-action-grid"><button onClick={() => { setSection("Audits"); setShowAuditForm(true); }}><span className="quick-icon"><Icon name="plus" /></span><span><b>Start audit</b><small>Create a new inspection</small></span><Icon name="arrow" /></button><button onClick={() => setSection("Audits")}><span className="quick-icon"><Icon name="audit" /></span><span><b>Audit register</b><small>Continue a saved audit</small></span><Icon name="arrow" /></button><button onClick={() => setSection("Observations")}><span className="quick-icon"><Icon name="eye" /></span><span><b>Observations</b><small>Review NC and OFI findings</small></span><Icon name="arrow" /></button><button onClick={() => setSection("Reports")}><span className="quick-icon"><Icon name="report" /></span><span><b>Reports</b><small>Generate and share PDFs</small></span><Icon name="arrow" /></button></div></section>
-          <div className="dashboard-bottom-grid"><section className="content-card recent-audits-card"><div className="card-heading"><div><span className="card-kicker">RECENT ACTIVITY</span><h3>Recent audits</h3><p>Your latest audit records.</p></div><button className="text-button" onClick={() => setSection("Audits")}>View all <Icon name="arrow" /></button></div>{audits.length ? <div className="recent-audit-list">{audits.slice(0, 4).map((audit) => <button className="recent-audit-row" key={audit.id} onClick={() => { setSection("Audits"); void openAudit(audit); }}><span className="recent-audit-icon"><Icon name="audit" /></span><span className="recent-audit-copy"><b>{audit.title}</b><small>{audit.plantName} · {audit.auditDate}</small></span><span className="recent-audit-status">{audit.status.replaceAll("_", " ")}</span><Icon name="arrow" /></button>)}</div> : <div className="dashboard-empty"><p>No audits have been created on this device yet.</p><button className="secondary-button" onClick={() => { setSection("Audits"); setShowAuditForm(true); }}>Create first audit <Icon name="arrow" /></button></div>}</section>
+          <div className="dashboard-bottom-grid"><section className="content-card recent-audits-card"><div className="card-heading"><div><span className="card-kicker">RECENT ACTIVITY</span><h3>Recent audits</h3><p>Your latest audit records.</p></div><button className="text-button" onClick={() => setSection("Audits")}>View all <Icon name="arrow" /></button></div>{visibleAudits.length ? <div className="recent-audit-list">{visibleAudits.slice(0, 4).map((audit) => <button className="recent-audit-row" key={audit.id} onClick={() => { setSection("Audits"); void openAudit(audit); }}><span className="recent-audit-icon"><Icon name="audit" /></span><span className="recent-audit-copy"><b>{audit.title}</b><small>{audit.plantName} · {audit.auditDate}</small></span><span className="recent-audit-status">{audit.status.replaceAll("_", " ")}</span><Icon name="arrow" /></button>)}</div> : <div className="dashboard-empty"><p>No audits have been created for your assigned plant(s) yet.</p><button className="secondary-button" onClick={() => { setSection("Audits"); setShowAuditForm(true); }}>Create first audit <Icon name="arrow" /></button></div>}</section>
             <section className="content-card current-site-card"><div className="card-heading"><div><span className="card-kicker">WORKSPACE</span><h3>Current site</h3><p>Active inspection location.</p></div><div className="metric-icon"><Icon name="site" /></div></div><div className="current-site-name"><span className="site-pin"><Icon name="site" /></span><div><b>{current.siteName}</b><small>{current.siteLocation || "Location not specified"}</small></div></div><div className="summary-divider" /><div className="summary-line"><span>Organization</span><b>{current.organizationName}</b></div><div className="summary-line"><span>Registered plants</span><b>{plantsCount}</b></div><button className="secondary-button full-button" onClick={() => setSection("Sites & Plants")}>Manage plants <Icon name="arrow" /></button></section></div>
         </div>}
 
@@ -1846,18 +1917,18 @@ export default function App() {
             </div>
             <div className="form-actions"><button type="button" className="secondary-button" onClick={() => setSpecPlant(null)}>Cancel</button><button className="primary-button" type="submit" disabled={specSaving}>{specSaving ? "Saving…" : "Save specifications"}</button></div>
           </form>}
-          {plantsCount === 0 ? <div className="empty-state"><div className="empty-icon"><Icon name="plant" /></div><h3>No plants added yet</h3><p>No plants are available in the current workspace. Connect to the backend and refresh reference data, or add an offline draft.</p><button className="primary-button" onClick={() => setShowPlantForm(true)}><Icon name="plus" /> Add first plant</button></div> : <div className="plant-list">{current.plants.map((plant) => <div className="plant-record" key={plant.id}><article className="plant-row"><div className="plant-symbol"><Icon name="plant" /></div><div className="plant-details"><b>{plant.name}</b><small>{plant.location || "Location not provided"}</small><small>{(plant.equipment ?? []).length} registered equipment item(s)</small></div><div className="plant-capacity"><small>CAPACITY</small><b>{plant.capacityMw ? `${plant.capacityMw} MW` : "—"}</b></div>{plant.source === "server" || plant.serverPlantId ? <><span className="site-status">Backend managed</span><button type="button" className="secondary-button" onClick={() => void editPlantSpecifications(plant)}>Plant specifications</button><button type="button" className="secondary-button" onClick={() => setConfigurePlantId((currentId) => currentId === plant.id ? "" : plant.id)}>{configurePlantId === plant.id ? "Done" : "Configure equipment"}</button></> : <><button type="button" className="secondary-button" onClick={() => void editPlantSpecifications(plant)}>Plant specifications</button><button type="button" className="secondary-button" onClick={() => setConfigurePlantId((currentId) => currentId === plant.id ? "" : plant.id)}>{configurePlantId === plant.id ? "Done" : "Configure equipment"}</button><button className="delete-button" onClick={() => deletePlant(plant.id)} aria-label={`Delete ${plant.name}`} title="Delete plant">×</button></>}</article>
+          {plantsCount === 0 ? <div className="empty-state"><div className="empty-icon"><Icon name="plant" /></div><h3>No plants assigned yet</h3><p>No plants are assigned to your account yet. Contact your site administrator or sign in again.</p>{isAdminUser && <button className="primary-button" onClick={() => setShowPlantForm(true)}><Icon name="plus" /> Add first plant</button>}</div> : <div className="plant-list">{visiblePlants.map((plant) => <div className="plant-record" key={plant.id}><article className="plant-row"><div className="plant-symbol"><Icon name="plant" /></div><div className="plant-details"><b>{plant.name}</b><small>{plant.location || "Location not provided"}</small><small>{(plant.equipment ?? []).length} registered equipment item(s)</small></div><div className="plant-capacity"><small>CAPACITY</small><b>{plant.capacityMw ? `${plant.capacityMw} MW` : "—"}</b></div>{plant.source === "server" || plant.serverPlantId ? <><span className="site-status">Backend managed</span><button type="button" className="secondary-button" onClick={() => void editPlantSpecifications(plant)}>Plant specifications</button><button type="button" className="secondary-button" onClick={() => setConfigurePlantId((currentId) => currentId === plant.id ? "" : plant.id)}>{configurePlantId === plant.id ? "Done" : "Configure equipment"}</button></> : <><button type="button" className="secondary-button" onClick={() => void editPlantSpecifications(plant)}>Plant specifications</button><button type="button" className="secondary-button" onClick={() => setConfigurePlantId((currentId) => currentId === plant.id ? "" : plant.id)}>{configurePlantId === plant.id ? "Done" : "Configure equipment"}</button><button className="delete-button" onClick={() => deletePlant(plant.id)} aria-label={`Delete ${plant.name}`} title="Delete plant">×</button></>}</article>
             {configurePlantId === plant.id && <div className="plant-inventory-editor"><h4>Equipment inventory · {plant.name}</h4><div className="inventory-category-groups">{Object.entries((plant.equipment ?? []).reduce<Record<string, PlantEquipment[]>>((groups, item) => { const category = item.category || "Other / Custom"; (groups[category] ??= []).push(item); return groups; }, {})).length > 0 ? Object.entries((plant.equipment ?? []).reduce<Record<string, PlantEquipment[]>>((groups, item) => { const category = item.category || "Other / Custom"; (groups[category] ??= []).push(item); return groups; }, {})).map(([category, items]) => <details className="inventory-category-group" key={category}><summary className="inventory-category-summary-row"><span className="inventory-category-check" aria-label="Registered">✓</span><span className="inventory-category-name">{category}</span><b className="inventory-category-count">{items.length}</b><span className="inventory-category-chevron" aria-hidden="true">⌄</span></summary><div className="inventory-category-items">{items.map((item) => <div className="inventory-item-admin-row" key={item.id}><span>{item.name}</span><button type="button" className="text-button" onClick={() => renamePlantEquipment(plant.id, item.id, item.name)}>Rename</button><button type="button" className="delete-button" onClick={() => removePlantEquipment(plant.id, item.id, item.name)} aria-label={`Remove ${item.name}`}>×</button></div>)}</div></details>) : <p>No equipment registered yet.</p>}</div><div className="form-grid"><label>Category<select value={existingEquipmentCategory} onChange={(e) => setExistingEquipmentCategory(e.target.value)}><option value="">Select category</option>{equipmentCategories.map((category) => <option key={category} value={category}>{category}</option>)}</select></label><label>Quantity to add<input type="number" min="1" max="500" value={existingEquipmentQuantity} onChange={(e) => setExistingEquipmentQuantity(e.target.value)} /></label></div><button type="button" className="primary-button" onClick={() => addEquipmentToExistingPlant(plant.id)}>Add registered equipment</button></div>}
           </div>)}</div>}
         </div>}
 
         {section === "Audits" && <div className="page-content">
-          <div className="section-heading"><div><h2>Audit register</h2><p>Create and manage audit drafts for your registered plants.</p></div>{!activeAudit && !summaryAudit && <button className="primary-button" onClick={() => setShowAuditForm((v) => !v)} disabled={current.plants.length === 0}><Icon name="plus" /> Create audit</button>}</div>
-          {current.plants.length === 0 && <div className="inline-notice">Add at least one plant before creating an audit.</div>}
+          <div className="section-heading"><div><h2>Audit register</h2><p>Create and manage audit drafts for your assigned plant(s).</p></div>{!activeAudit && !summaryAudit && <button className="primary-button" onClick={() => setShowAuditForm((v) => !v)} disabled={visiblePlants.length === 0}><Icon name="plus" /> Create audit</button>}</div>
+          {visiblePlants.length === 0 && <div className="inline-notice">No plant is assigned to this account yet.</div>}
           {showAuditForm && <form className="content-card plant-form" onSubmit={handleCreateAudit}>
             <div className="card-heading"><div><h3>New audit</h3><p>Create one audit with Technical, Safety, and Civil sections.</p></div><button type="button" className="close-button" onClick={() => setShowAuditForm(false)} aria-label="Close">×</button></div>
             <div className="form-grid">
-              <label>Plant <span>*</span><select value={auditPlantId} onChange={(e) => setAuditPlantId(e.target.value)} required><option value="">Select a plant</option>{current.plants.map((plant) => <option key={plant.id} value={plant.id}>{plant.name}</option>)}</select></label>
+              <label>Plant <span>*</span><select value={auditPlantId} onChange={(e) => setAuditPlantId(e.target.value)} required><option value="">Select a plant</option>{visiblePlants.map((plant) => <option key={plant.id} value={plant.id}>{plant.name}</option>)}</select></label>
               <label>Audit title <span>*</span><input value={auditTitle} onChange={(e) => setAuditTitle(e.target.value)} placeholder="e.g. Monthly site audit" required /></label>
               <label>Audit date <span>*</span><input type="date" value={auditDate} onChange={(e) => setAuditDate(e.target.value)} required /></label>
               <label>Auditor name <span>*</span><input value={auditAuditor} onChange={(e) => setAuditAuditor(e.target.value)} placeholder="Enter auditor name" required /></label>
@@ -1902,18 +1973,18 @@ export default function App() {
             </>}
             <div className="submit-audit-panel"><div><b>Finish and lock this audit</b><small>Submit Audit finalizes the entire audit and prevents further edits.</small></div><div className="form-actions submit-audit-actions"><button type="button" className="primary-button" disabled={!activeAudit || activeAudit.status === "submitted"} onClick={() => void submitAudit()}>Submit Audit</button>{activeAudit?.status === "submitted" && <span className="observation-meta">Audit submitted and locked</span>}</div></div>
           </section>}
-          {!activeAudit && !summaryAudit && (audits.length === 0 ? <div className="empty-state large-empty"><div className="empty-icon"><Icon name="audit" /></div><span className="card-kicker">AUDIT REGISTER</span><button type="button" className="secondary-button" onClick={() => void refreshServerAuditStatuses()} disabled={!serverToken}>Refresh server statuses</button><h3>No audits created yet</h3><p>Create your first Technical, Safety, or Civil audit. Nothing is preloaded.</p><button className="primary-button" onClick={() => setShowAuditForm(true)} disabled={current.plants.length === 0}><Icon name="plus" /> Create first audit</button></div> : <div className="audit-list">{audits.map((audit) => <article className="audit-row" key={audit.id}><div className="audit-type-mark"><Icon name="audit" /></div><div className="audit-copy"><b>{audit.title}</b><small>{audit.plantName || current.plants.find((p) => p.id === audit.plantId)?.name || "Plant"} · {audit.auditType} · {audit.auditDate}</small><small>Auditor: {audit.auditor}</small></div><span className="audit-status">{audit.status.replace("_", " ")}</span><button className="secondary-button open-audit-button" onClick={() => void openAudit(audit)}>Open audit</button><button type="button" className="secondary-button open-audit-button" onClick={() => void refreshServerAuditStatuses()} disabled={!serverToken}>Refresh statuses</button><button type="button" className="secondary-button open-audit-button" disabled={!serverToken || auditSyncBusyId === audit.id} onClick={() => void syncOneAuditManifest(audit)}>{auditSyncBusyId === audit.id ? "Syncing…" : "Sync manifest"}</button>{auditSyncMessages[audit.id] && <small className="server-result" role="status">{auditSyncMessages[audit.id]}</small>}</article>)}</div>)}
+          {!activeAudit && !summaryAudit && (visibleAudits.length === 0 ? <div className="empty-state large-empty"><div className="empty-icon"><Icon name="audit" /></div><span className="card-kicker">AUDIT REGISTER</span><button type="button" className="secondary-button" onClick={() => void refreshServerAuditStatuses()} disabled={!serverToken}>Refresh server statuses</button><h3>No audits created yet</h3><p>Create your first Technical, Safety, or Civil audit for your assigned plant.</p><button className="primary-button" onClick={() => setShowAuditForm(true)} disabled={visiblePlants.length === 0}><Icon name="plus" /> Create first audit</button></div> : <div className="audit-list">{visibleAudits.map((audit) => <article className="audit-row" key={audit.id}><div className="audit-type-mark"><Icon name="audit" /></div><div className="audit-copy"><b>{audit.title}</b><small>{audit.plantName || current.plants.find((p) => p.id === audit.plantId)?.name || "Plant"} · {audit.auditType} · {audit.auditDate}</small><small>Auditor: {audit.auditor}</small></div><span className="audit-status">{audit.status.replace("_", " ")}</span><button className="secondary-button open-audit-button" onClick={() => void openAudit(audit)}>Open audit</button><button type="button" className="secondary-button open-audit-button" onClick={() => void refreshServerAuditStatuses()} disabled={!serverToken}>Refresh statuses</button><button type="button" className="secondary-button open-audit-button" disabled={!serverToken || auditSyncBusyId === audit.id} onClick={() => void syncOneAuditManifest(audit)}>{auditSyncBusyId === audit.id ? "Syncing…" : "Sync manifest"}</button>{auditSyncMessages[audit.id] && <small className="server-result" role="status">{auditSyncMessages[audit.id]}</small>}</article>)}</div>)}
         </div>}
         {section === "Observations" && <div className="page-content">
-          <div className="section-heading"><div><h2>Observations</h2><p>NC and OFI findings across your saved audits.</p></div><div className="form-actions"><span className="date-tag">{observations.filter(o => ["open", "in_progress", "rejected", "reopened"].includes(o.status)).length} OPEN</span><button className="secondary-button" onClick={() => void refreshServerObservations()}>Sync observations</button></div></div>
-          {observations.length > 0 && <section className="observation-filter-panel" aria-label="Filter observations">
+          <div className="section-heading"><div><h2>Observations</h2><p>NC and OFI findings across your assigned plant audits.</p></div><div className="form-actions"><span className="date-tag">{visibleObservations.filter(o => ["open", "in_progress", "rejected", "reopened"].includes(o.status)).length} OPEN</span><button className="secondary-button" onClick={() => void refreshServerObservations()}>Sync observations</button></div></div>
+          {visibleObservations.length > 0 && <section className="observation-filter-panel" aria-label="Filter observations">
             <label className="observation-search"><span>Search observations</span><input type="search" value={observationSearch} onChange={(event) => setObservationSearch(event.target.value)} placeholder="Search title, checkpoint, audit or person…" /></label>
             <div className="observation-filter-row">
               <label><span>Finding type</span><select value={observationFindingFilter} onChange={(event) => setObservationFindingFilter(event.target.value as "ALL" | FindingType)}><option value="ALL">All findings</option><option value="NC">NC only</option><option value="OFI">OFI only</option></select></label>
               <label><span>Status</span><select value={observationStatusFilter} onChange={(event) => setObservationStatusFilter(event.target.value)}><option value="all">All statuses</option><option value="open">Open</option><option value="in_progress">In progress</option></select></label>
               <label><span>Plant</span><select value={observationPlantFilter} onChange={(event) => setObservationPlantFilter(event.target.value)}><option value="all">All plants</option>{observationPlants.map((plant) => <option key={plant} value={plant}>{plant}</option>)}</select></label>
             </div>
-            <div className="observation-filter-footer"><span>Showing <b>{filteredObservations.length}</b> of {observations.length} observations</span><button type="button" className="text-button" onClick={() => { setObservationSearch(""); setObservationFindingFilter("ALL"); setObservationStatusFilter("all"); setObservationPlantFilter("all"); }}>Clear filters</button></div>
+            <div className="observation-filter-footer"><span>Showing <b>{filteredObservations.length}</b> of {visibleObservations.length} observations</span><button type="button" className="text-button" onClick={() => { setObservationSearch(""); setObservationFindingFilter("ALL"); setObservationStatusFilter("all"); setObservationPlantFilter("all"); }}>Clear filters</button></div>
           </section>}
           {observationDraft && <form className="content-card observation-form" onSubmit={(event) => void handleCreateObservation(event)}>
             <div className="card-heading"><div><span className="card-kicker">{observationDraft.findingType === "NC" ? "NON-COMPLIANCE" : "OPPORTUNITY FOR IMPROVEMENT"}</span><h3>{observationDraft.observationId ? "Complete observation details" : `New ${observationDraft.findingType} observation`}</h3><p>{observationDraft.checkpointText}</p></div><button type="button" className="secondary-button" onClick={() => setObservationDraft(null)}>Cancel</button></div>
@@ -1921,24 +1992,24 @@ export default function App() {
             {(() => { const linked = observations.find(o => o.id === observationDraft.observationId); const checkpointPhotos = linked?.photos ?? []; return <div className="observation-photo-panel"><h4>Observation photos</h4><p>Inspection photos captured at this checkpoint appear here automatically.</p>{checkpointPhotos.length > 0 ? <div className="checkpoint-photo-grid">{checkpointPhotos.map((photo, index) => <div className="checkpoint-photo-item" key={`source-${index}`}><div className="photo-thumb-wrap"><img src={photo.src} alt={`Checkpoint inspection ${index + 1}`} />{renderPhotoLocationBadge(photo)}</div><small>Inspection photo {index + 1}</small>{photo.remark && <small className="photo-remark-readonly">{photo.remark}</small>}</div>)}</div> : <small>No checkpoint photos attached.</small>}<h4>Photos of action taken</h4><div className="photo-action-buttons"><button type="button" className="secondary-button photo-capture-button" onClick={() => void takeObservationActionPhoto()}>📷 Capture Action Photo</button><label className="secondary-button photo-capture-button">🖼️ Choose from Gallery<input className="photo-file-input" type="file" accept="image/*" multiple onChange={(event) => { const files = Array.from(event.currentTarget.files ?? []); files.forEach(file => void addObservationActionPhoto(file)); event.currentTarget.value = ""; }} /></label></div>{observationActionPhotos.length > 0 && <div className="checkpoint-photo-grid">{observationActionPhotos.map((photo, index) => <div className="checkpoint-photo-item" key={`action-${index}`}><div className="photo-thumb-wrap"><img src={photo.src} alt={`Action taken photo ${index + 1}`} />{renderPhotoLocationBadge(photo)}</div><input type="text" className="photo-remark-input" placeholder="Add photo remark..." value={photo.remark ?? ""} onChange={(e) => setObservationActionPhotos((curr) => curr.map((item, i) => i === index ? { ...item, remark: e.target.value } : item))} /><button type="button" onClick={() => setObservationActionPhotos(current => current.filter((_, i) => i !== index))}>Remove</button></div>)}</div>}</div>; })()}
             <div className="form-actions"><button type="submit" className="primary-button">Save observation</button></div>
           </form>}
-          {observations.length === 0 ? <div className="empty-state large-empty"><div className="empty-icon"><Icon name="eye" /></div><h3>No observations yet</h3><p>Submit an audit with NC or OFI checkpoints to create observations here. Complete the follow-up details after submission.</p><button className="secondary-button" onClick={() => setSection("Audits")}>Go to audits <Icon name="arrow" /></button></div> : filteredObservations.length === 0 ? <div className="empty-state observation-no-results"><h3>No matching observations</h3><p>Try changing the search text or clearing one or more filters.</p><button type="button" className="secondary-button" onClick={() => { setObservationSearch(""); setObservationFindingFilter("ALL"); setObservationStatusFilter("all"); setObservationPlantFilter("all"); }}>Clear filters</button></div> : <div className="observation-list">{(() => { const plantGroups = new Map<string, LocalObservation[]>(); filteredObservations.forEach((o) => plantGroups.set(o.plantName || "Plant", [...(plantGroups.get(o.plantName || "Plant") ?? []), o])); return [...plantGroups.entries()].map(([plant, plantItems]) => { const auditGroups = new Map<string, LocalObservation[]>(); plantItems.forEach((o) => auditGroups.set(o.auditId, [...(auditGroups.get(o.auditId) ?? []), o])); return <details className="summary-observation-group observation-plant-group" key={plant} open><summary>{plant}<span>{plantItems.length} observation(s)</span></summary><div>{[...auditGroups.entries()].map(([auditId, auditItems]) => { return <details className="summary-observation-group" key={auditId}><summary>{auditItems[0]?.auditTitle || "Audit"}<span>{auditItems.length} observation(s)</span></summary><div>{auditItems.map((o) => <article className="content-card observation-row" key={o.id}><div className="observation-row-top"><span className={`finding-tag finding-${o.findingType.toLowerCase()}`}>{o.findingType}</span><span className={`observation-status status-${o.status}`}>{o.status}</span></div><h3>{o.title}</h3><p className="observation-meta">{o.checkpointText}</p>{o.description && <p>{o.description}</p>}<div className="observation-details"><span>Severity <b>{o.severity || "Unclassified"}</b></span><span>Responsible <b>{o.responsiblePerson || "Not assigned"}</b></span><span>Target date <b>{o.targetDate || "Not set"}</b></span></div>{o.actionText && <p><b>{o.findingType === "NC" ? "Corrective action / Action taken:" : "Improvement action / Action taken:"}</b> {o.actionText}</p>}{(o.photos?.length ?? 0) > 0 && <div className="observation-inline-photos"><b>Inspection photos</b><div className="checkpoint-photo-grid">{(o.photos ?? []).map((photo, index) => <div className="checkpoint-photo-item" key={`obs-${o.id}-${index}`}><div className="photo-thumb-wrap"><img src={photo.src} alt={`Inspection photo ${index + 1}`} />{renderPhotoLocationBadge(photo)}</div>{photo.remark && <small className="photo-remark-readonly">{photo.remark}</small>}</div>)}</div></div>}{(o.actionPhotos?.length ?? 0) > 0 && <div className="observation-inline-photos"><b>Action taken photos</b><div className="checkpoint-photo-grid">{(o.actionPhotos ?? []).map((photo, index) => <div className="checkpoint-photo-item" key={`obs-action-${o.id}-${index}`}><div className="photo-thumb-wrap"><img src={photo.src} alt={`Action taken photo ${index + 1}`} />{renderPhotoLocationBadge(photo)}</div>{photo.remark && <small className="photo-remark-readonly">{photo.remark}</small>}</div>)}</div></div>}<div className="observation-meta">{o.serverObservationId ? <span>Backend: {o.status.replace("_", " ")}</span> : <span>Local only{o.findingType === "OFI" ? " · awaiting audit sync" : " · awaiting audit sync"}</span>}{o.syncStatus === "error" && <span className="error-text">Sync issue: {o.syncError || "retry required"}</span>}</div><div className="form-actions"><button className="secondary-button" onClick={() => editObservation(o)}>Complete details</button>{o.serverObservationId && ["open", "in_progress", "rejected", "reopened"].includes(o.status) && <button className="primary-button" onClick={() => void submitObservationForReview(o)}>Submit for review</button>}</div></article>)}</div></details>; })}</div></details>; }); })()}</div>}
+          {visibleObservations.length === 0 ? <div className="empty-state large-empty"><div className="empty-icon"><Icon name="eye" /></div><h3>No observations yet</h3><p>Submit an audit with NC or OFI checkpoints to create observations here. Complete the follow-up details after submission.</p><button className="secondary-button" onClick={() => setSection("Audits")}>Go to audits <Icon name="arrow" /></button></div> : filteredObservations.length === 0 ? <div className="empty-state observation-no-results"><h3>No matching observations</h3><p>Try changing the search text or clearing one or more filters.</p><button type="button" className="secondary-button" onClick={() => { setObservationSearch(""); setObservationFindingFilter("ALL"); setObservationStatusFilter("all"); setObservationPlantFilter("all"); }}>Clear filters</button></div> : <div className="observation-list">{(() => { const plantGroups = new Map<string, LocalObservation[]>(); filteredObservations.forEach((o) => plantGroups.set(o.plantName || "Plant", [...(plantGroups.get(o.plantName || "Plant") ?? []), o])); return [...plantGroups.entries()].map(([plant, plantItems]) => { const auditGroups = new Map<string, LocalObservation[]>(); plantItems.forEach((o) => auditGroups.set(o.auditId, [...(auditGroups.get(o.auditId) ?? []), o])); return <details className="summary-observation-group observation-plant-group" key={plant} open><summary>{plant}<span>{plantItems.length} observation(s)</span></summary><div>{[...auditGroups.entries()].map(([auditId, auditItems]) => { return <details className="summary-observation-group" key={auditId}><summary>{auditItems[0]?.auditTitle || "Audit"}<span>{auditItems.length} observation(s)</span></summary><div>{auditItems.map((o) => <article className="content-card observation-row" key={o.id}><div className="observation-row-top"><span className={`finding-tag finding-${o.findingType.toLowerCase()}`}>{o.findingType}</span><span className={`observation-status status-${o.status}`}>{o.status}</span></div><h3>{o.title}</h3><p className="observation-meta">{o.checkpointText}</p>{o.description && <p>{o.description}</p>}<div className="observation-details"><span>Severity <b>{o.severity || "Unclassified"}</b></span><span>Responsible <b>{o.responsiblePerson || "Not assigned"}</b></span><span>Target date <b>{o.targetDate || "Not set"}</b></span></div>{o.actionText && <p><b>{o.findingType === "NC" ? "Corrective action / Action taken:" : "Improvement action / Action taken:"}</b> {o.actionText}</p>}{(o.photos?.length ?? 0) > 0 && <div className="observation-inline-photos"><b>Inspection photos</b><div className="checkpoint-photo-grid">{(o.photos ?? []).map((photo, index) => <div className="checkpoint-photo-item" key={`obs-${o.id}-${index}`}><div className="photo-thumb-wrap"><img src={photo.src} alt={`Inspection photo ${index + 1}`} />{renderPhotoLocationBadge(photo)}</div>{photo.remark && <small className="photo-remark-readonly">{photo.remark}</small>}</div>)}</div></div>}{(o.actionPhotos?.length ?? 0) > 0 && <div className="observation-inline-photos"><b>Action taken photos</b><div className="checkpoint-photo-grid">{(o.actionPhotos ?? []).map((photo, index) => <div className="checkpoint-photo-item" key={`obs-action-${o.id}-${index}`}><div className="photo-thumb-wrap"><img src={photo.src} alt={`Action taken photo ${index + 1}`} />{renderPhotoLocationBadge(photo)}</div>{photo.remark && <small className="photo-remark-readonly">{photo.remark}</small>}</div>)}</div></div>}<div className="observation-meta">{o.serverObservationId ? <span>Backend: {o.status.replace("_", " ")}</span> : <span>Local only{o.findingType === "OFI" ? " · awaiting audit sync" : " · awaiting audit sync"}</span>}{o.syncStatus === "error" && <span className="error-text">Sync issue: {o.syncError || "retry required"}</span>}</div><div className="form-actions"><button className="secondary-button" onClick={() => editObservation(o)}>Complete details</button>{o.serverObservationId && ["open", "in_progress", "rejected", "reopened"].includes(o.status) && <button className="primary-button" onClick={() => void submitObservationForReview(o)}>Submit for review</button>}</div></article>)}</div></details>; })}</div></details>; }); })()}</div>}
         </div>}
         {section === "Reports" && <div className="page-content">
           <div className="section-heading report-heading">
             <div><span className="card-kicker">DOCUMENT CENTRE</span><h2>Audit Reports</h2><p>Generate and share audit PDFs with checklist results, inspection photos, observations and action-taken photos.</p></div>
-            <span className="date-tag">{audits.length} AUDIT(S)</span>
+            <span className="date-tag">{visibleAudits.length} AUDIT(S)</span>
           </div>
           <div className="local-note report-note"><Icon name="report" /><span><b>Reports are generated on this device</b><br />Submitted audits are locked. Draft reports are clearly labelled with their current status.</span></div>
           <div className="report-metrics">
-            <div className="report-metric-card"><span>Total audits</span><b>{audits.length}</b><small>Available for reporting</small></div>
-            <div className="report-metric-card"><span>Submitted</span><b>{audits.filter((audit) => audit.status === "submitted").length}</b><small>Completed audit records</small></div>
-            <div className="report-metric-card"><span>In progress</span><b>{audits.filter((audit) => audit.status === "in_progress").length}</b><small>Drafts and active work</small></div>
+            <div className="report-metric-card"><span>Total audits</span><b>{visibleAudits.length}</b><small>Available for reporting</small></div>
+            <div className="report-metric-card"><span>Submitted</span><b>{visibleAudits.filter((audit) => audit.status === "submitted").length}</b><small>Completed audit records</small></div>
+            <div className="report-metric-card"><span>In progress</span><b>{visibleAudits.filter((audit) => audit.status === "in_progress").length}</b><small>Drafts and active work</small></div>
           </div>
-          {audits.length === 0 ? <div className="empty-state large-empty"><div className="empty-icon"><Icon name="report" /></div><h3>No audits available</h3><p>Create an audit and save checklist results before generating a report.</p><button className="secondary-button" onClick={() => setSection("Audits")}>View audits <Icon name="arrow" /></button></div> : <>
+          {visibleAudits.length === 0 ? <div className="empty-state large-empty"><div className="empty-icon"><Icon name="report" /></div><h3>No audits available</h3><p>Create an audit and save checklist results before generating a report.</p><button className="secondary-button" onClick={() => setSection("Audits")}>View audits <Icon name="arrow" /></button></div> : <>
             <div className="report-toolbar">
               <label className="report-search"><span>Search audits</span><input value={reportSearch} onChange={(event) => setReportSearch(event.target.value)} placeholder="Search audit, plant or auditor..." /></label>
               <label className="report-status-filter"><span>Status</span><select value={reportStatusFilter} onChange={(event) => setReportStatusFilter(event.target.value)}><option value="all">All statuses</option><option value="in_progress">In progress</option><option value="submitted">Submitted</option><option value="draft">Draft</option></select></label>
-              <div className="report-result-count">{audits.filter((audit) => {
+              <div className="report-result-count">{visibleAudits.filter((audit) => {
                 const query = reportSearch.trim().toLowerCase();
                 const plant = audit.plantName || current.plants.find((p) => p.id === audit.plantId)?.name || "Plant";
                 const matchesSearch = !query || [audit.title, plant, audit.auditor || "", audit.auditType, audit.auditDate].some((value) => String(value).toLowerCase().includes(query));
@@ -1946,7 +2017,7 @@ export default function App() {
                 return matchesSearch && matchesStatus;
               }).length} report(s) found</div>
             </div>
-            <div className="report-list">{audits.filter((audit) => {
+            <div className="report-list">{visibleAudits.filter((audit) => {
               const query = reportSearch.trim().toLowerCase();
               const plant = audit.plantName || current.plants.find((p) => p.id === audit.plantId)?.name || "Plant";
               const matchesSearch = !query || [audit.title, plant, audit.auditor || "", audit.auditType, audit.auditDate].some((value) => String(value).toLowerCase().includes(query));
@@ -1957,7 +2028,7 @@ export default function App() {
               <div className="audit-copy"><b>{audit.title}</b><small>{audit.plantName || current.plants.find((p) => p.id === audit.plantId)?.name || "Plant"} · {audit.auditType} · {audit.auditDate}</small><small>Auditor: {audit.auditor || "Not specified"}</small></div>
               <button className="primary-button report-generate-button" onClick={() => void generateAuditReport(audit)}><Icon name="report" /> Generate PDF</button>
             </article>)}
-              {audits.filter((audit) => {
+              {visibleAudits.filter((audit) => {
                 const query = reportSearch.trim().toLowerCase();
                 const plant = audit.plantName || current.plants.find((p) => p.id === audit.plantId)?.name || "Plant";
                 const matchesSearch = !query || [audit.title, plant, audit.auditor || "", audit.auditType, audit.auditDate].some((value) => String(value).toLowerCase().includes(query));
@@ -1969,11 +2040,11 @@ export default function App() {
         </div>}
         {section === "Settings" && <div className="page-content">
           <section className="content-card settings-card">
-            <div className="card-heading"><div><h3>Workspace settings</h3><p>Review the information saved on this device.</p></div><div className="metric-icon"><Icon name="settings" /></div></div>
+            <div className="card-heading"><div><h3>Workspace &amp; account scope</h3><p>Active user and plant assignment on this device.</p></div><div className="metric-icon"><Icon name="settings" /></div></div>
             <div className="settings-field"><span>Organization</span><b>{current.organizationName}</b></div>
             <div className="settings-field"><span>Site name</span><b>{current.siteName}</b></div>
-            <div className="settings-field"><span>Site location</span><b>{current.siteLocation || "Not provided"}</b></div>
-            <div className="settings-field"><span>Plants registered locally</span><b>{plantsCount}</b></div>
+            <div className="settings-field"><span>Signed-in user</span><b>{assignedUser ? `${assignedUser.fullName || assignedUser.username} (${assignedUser.username})` : "Not signed in"}</b></div>
+            <div className="settings-field"><span>Assigned plant(s)</span><b>{visiblePlants.length ? visiblePlants.map((p) => p.name).join(", ") : "None"}</b></div>
           </section>
           <section className="content-card settings-card server-connection-card">
             <div className="card-heading"><div><span className="card-kicker">STAGE 1 · CONNECTIVITY TEST</span><h3>Native server connection</h3><p>Sign in and verify that the backend can return the configured site and reference data. This does not upload or modify audits.</p></div><span className={`connection-pill ${serverToken ? "connected" : "disconnected"}`}><span className="status-dot" />{serverToken ? "Connected" : "Not connected"}</span></div>
@@ -1990,7 +2061,7 @@ export default function App() {
             {serverBootstrap && <div className="server-bootstrap-summary"><div className="settings-field"><span>Authenticated user</span><b>{serverBootstrap.user?.full_name || serverBootstrap.user?.username}</b></div><div className="settings-field"><span>Configured server site</span><b>{serverBootstrap.sites[0]?.name || "No site returned"}</b></div><div className="settings-field"><span>Plants returned by server</span><b>{serverBootstrap.sites.reduce((count, site) => count + (site.plants?.length ?? 0), 0)}</b></div><div className="settings-field"><span>API version</span><b>{serverBootstrap.api_version || "Unknown"}</b></div><p className="field-hint">Reference data is stored separately from the active workspace. It will not overwrite local plant or audit records.</p><button type="button" className="primary-button full-button" onClick={() => void downloadAndCacheReferenceData()} disabled={referenceDataBusy || !serverToken}>{referenceDataBusy ? "Downloading reference data…" : "Download & cache reference data"}</button>{referenceDataMessage && <div className={`server-result ${referenceDataMessage.startsWith("Reference data cached") ? "success" : ""}`} role="status">{referenceDataMessage}</div>}</div>}
             <div className="local-note settings-note"><Icon name="cloud" /><span><b>Connection & data safety</b><br />The API address is remembered on this device. Your password and access token are never saved; sign in again after restarting the app. Signing in verifies access and loads reference data only—it does not upload audits, photos, observations, or workspace records.</span></div>
           </section>
-          <section className="content-card settings-card"><div className="danger-zone"><div><b>Reset local workspace</b><small>Removes this workspace and its plant list from this device only.</small></div><button className="danger-button" onClick={resetWorkspace}>Reset workspace</button></div></section>
+          <section className="content-card settings-card"><div className="danger-zone"><div><b>Sign out &amp; switch account</b><small>Clears the active workspace and returns to the login screen so another plant account can sign in.</small></div><button className="danger-button" onClick={resetWorkspace}>Sign out &amp; switch</button></div></section>
         </div>}
         <footer className="main-footer"><span>Solar Audit Mobile</span><span>Offline-ready field inspection workspace</span></footer>
       </main>

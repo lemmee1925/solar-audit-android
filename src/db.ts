@@ -133,11 +133,21 @@ export type LocalPlant = {
   source?: "local" | "server";
 };
 
+export type AssignedUserScope = {
+  id: string;
+  username: string;
+  fullName?: string;
+  role?: string;
+  siteId?: string;
+  assignedServerPlantIds?: string[];
+};
+
 export type LocalWorkspace = {
   organizationName: string;
   siteName: string;
   siteLocation: string;
   plants: LocalPlant[];
+  assignedUser?: AssignedUserScope;
 };
 
 function readLegacyWorkspace(): LocalWorkspace | null {
@@ -448,10 +458,25 @@ export async function loadWorkspace(): Promise<LocalWorkspace | null> {
     // A missing/invalid reference cache must never block local workspace access.
   }
 
+  let assignedUser: AssignedUserScope | undefined;
+  try {
+    const scopeRows = await db.query("SELECT value FROM app_meta WHERE key = ?", ["assigned_user_scope_v1"]);
+    const rawScope = scopeRows.values?.[0]?.value;
+    if (rawScope) {
+      const parsedScope = JSON.parse(String(rawScope));
+      if (parsedScope && typeof parsedScope === "object" && parsedScope.username) {
+        assignedUser = parsedScope as AssignedUserScope;
+      }
+    }
+  } catch {
+    // Keep local workspace accessible if scope metadata is unreadable.
+  }
+
   return {
     organizationName: String(org.name ?? ""),
     siteName: String(site.name ?? ""),
     siteLocation: String(site.location ?? ""),
+    assignedUser,
     plants: (plantRows.values ?? [])
       .filter((row) => {
         const isServerManaged = String(row.source ?? "") === "server" || row.server_plant_id != null;
@@ -518,6 +543,15 @@ export async function saveWorkspace(workspace: LocalWorkspace): Promise<void> {
          server_plant_id=excluded.server_plant_id, source=excluded.source`,
       [plant.id, siteId, plant.name, plant.location, plant.capacityMw, JSON.stringify(plant.equipment ?? []), plant.serverPlantId ?? null, plant.source ?? "local", now],
     );
+  }
+
+  if (workspace.assignedUser) {
+    await db.run(
+      "INSERT INTO app_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      ["assigned_user_scope_v1", JSON.stringify(workspace.assignedUser)],
+    );
+  } else {
+    await db.run("DELETE FROM app_meta WHERE key = ?", ["assigned_user_scope_v1"]);
   }
 }
 
@@ -623,10 +657,12 @@ export async function loadAuditSyncAcknowledgement(localAuditId: string): Promis
 
 export async function clearWorkspace(): Promise<void> {
   localStorage.removeItem(LEGACY_KEY);
+  localStorage.removeItem("solar-audit-server-reference-data-v1");
   const db = await (dbPromise ??= openDatabase());
   if (!db) return;
   // No manual BEGIN/COMMIT: avoid the inactive-transaction error.
   await db.run("DELETE FROM organizations");
+  await db.run("DELETE FROM app_meta WHERE key IN ('assigned_user_scope_v1', 'server_reference_data_v1')");
 }
 
 
