@@ -1,0 +1,20 @@
+Solar Audit Android Foundation — Plant-specific Equipment Inventory Update
+
+Changes:
+- Plant creation now supports configuring multiple equipment categories and quantities.
+- Equipment names are generated for each plant/category (e.g. Inverter 1, Inverter 2).
+- Existing plant records have a Configure equipment action to add inventory without recreating the plant.
+- During audit execution, choose equipment category first; the equipment-name dropdown only lists registered equipment for the audit's plant/category.
+- Equipment already added to the audit is filtered out of the dropdown to reduce accidental duplicates.
+- Inventory is retained in the existing workspace JSON/localStorage and merged when loading plant rows from SQLite. Existing DB tables and audit records are not destructively migrated.
+
+Apply:
+1. Back up your current project folder.
+2. Extract this ZIP to a new folder.
+3. In that folder run: npm install
+4. Run: npm run build
+5. If build succeeds, run: npx cap sync android
+6. Open Android Studio with: npx cap open android
+7. Build and test the APK.
+
+Note: TypeScript project build (`tsc -b`) was validated in the provided environment. Vite production bundling could not be run here because the ZIP contains Windows-specific optional Rollup binaries and this environment is Linux; run `npm install` on Windows before `npm run build`.

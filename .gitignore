@@ -1,0 +1,27 @@
+# Node / Vite
+node_modules/
+dist/
+build/
+.vite/
+
+# Android / Gradle / Capacitor generated outputs
+android/.gradle/
+android/build/
+android/app/build/
+android/capacitor-cordova-android-plugins/
+*.apk
+*.aab
+
+# Signing secrets (NEVER commit)
+android/keystore.properties
+*.jks
+*.keystore
+
+# Backup & temp files
+*.bak*
+*.before_*
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db

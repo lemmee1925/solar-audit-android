@@ -1,0 +1,898 @@
+﻿import { useEffect, useMemo, useState } from "react";
+import { Camera, CameraDirection, CameraResultType, CameraSource } from "@capacitor/camera";
+import { jsPDF } from "jspdf";
+import { Filesystem, Directory } from "@capacitor/filesystem";
+import { Share } from "@capacitor/share";
+import "./styles.css";
+import { TECHNICAL_CHECKLISTS, TECHNICAL_CATEGORIES, SAFETY_CHECKLIST } from "./checklistLibrary";
+import { addAuditCheckpoint, addAuditEquipment, clearWorkspace, createAudit, initializeLocalDatabase, loadAuditExecution, loadAudits, loadWorkspace, saveWorkspace, updateAuditCheckpoint, type AuditCheckpoint, type AuditEquipment, type AuditType, type LocalAudit, type LocalObservation, type FindingType, loadObservations, createObservation, updateObservationStatus, markAuditSubmitted, updateAuditType, updateObservationDetails, saveObservationActionPhotos } from "./db";
+
+type PlantEquipment = {
+  id: string;
+  name: string;
+  category: string;
+};
+
+type Plant = {
+  id: string;
+  name: string;
+  location: string;
+  capacityMw: string;
+  equipment?: PlantEquipment[];
+};
+
+type EquipmentPlan = { category: string; quantity: number };
+
+type Workspace = {
+  organizationName: string;
+  siteName: string;
+  siteLocation: string;
+  plants: Plant[];
+};
+
+type Section = "Dashboard" | "Sites & Plants" | "Audits" | "Observations" | "Reports" | "Settings";
+
+const STORAGE_KEY = "solar-audit-workspace-v1";
+const emptyWorkspace: Workspace = {
+  organizationName: "",
+  siteName: "",
+  siteLocation: "",
+  plants: [],
+};
+
+function readWorkspace(): Workspace | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Workspace;
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.plants)) return null;
+    return { ...emptyWorkspace, ...parsed, plants: parsed.plants };
+  } catch {
+    return null;
+  }
+}
+
+function Icon({ name }: { name: string }) {
+  const common = { width: 19, height: 19, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 1.8, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
+  const paths: Record<string, React.ReactNode> = {
+    grid: <><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></>,
+    site: <><path d="M3 21h18"/><path d="M5 21V7l7-4 7 4v14"/><path d="M9 21v-5h6v5"/><path d="M9 9h.01M15 9h.01M9 12h.01M15 12h.01"/></>,
+    audit: <><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h3"/></>,
+    eye: <><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6Z"/><circle cx="12" cy="12" r="2.5"/></>,
+    report: <><path d="M5 3h10l4 4v14H5z"/><path d="M15 3v5h4M8 12h8M8 16h8"/></>,
+    settings: <><circle cx="12" cy="12" r="3"/><path d="m19.4 15 .1.1 1.4 1.1-1.4 2.4-1.7-.6a7.7 7.7 0 0 1-1.7 1l-.3 1.8h-2.8l-.3-1.8a7.7 7.7 0 0 1-1.7-1l-1.7.6-1.4-2.4 1.4-1.1a7.4 7.4 0 0 1 0-2l-1.4-1.1 1.4-2.4 1.7.6a7.7 7.7 0 0 1 1.7-1l.3-1.8h2.8l.3 1.8a7.7 7.7 0 0 1 1.7 1l1.7-.6 1.4 2.4-1.4 1.1a7.4 7.4 0 0 1 0 2Z"/></>,
+    plus: <><path d="M12 5v14M5 12h14"/></>,
+    arrow: <><path d="M5 12h14M13 6l6 6-6 6"/></>,
+    sun: <><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></>,
+    plant: <><path d="M12 21v-9"/><path d="M12 12C4 12 4 5 4 5s7-1 8 7Z"/><path d="M12 16c0-7 8-8 8-8s1 7-8 8Z"/></>,
+    cloud: <><path d="M7 18a5 5 0 1 1 1-9.9A6 6 0 0 1 20 11a3.5 3.5 0 0 1-.5 7H7Z"/></>,
+  };
+  return <svg {...common} aria-hidden="true">{paths[name] ?? paths.grid}</svg>;
+}
+
+async function photoFileToDataUrl(file: File): Promise<string> {
+  const source = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => typeof reader.result === "string" ? resolve(reader.result) : reject(new Error("Could not read photo."));
+    reader.onerror = () => reject(new Error("Could not read photo."));
+    reader.readAsDataURL(file);
+  });
+  const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("Could not process photo."));
+    img.src = source;
+  });
+  const maxDimension = 1600;
+  const scale = Math.min(1, maxDimension / Math.max(image.naturalWidth, image.naturalHeight));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+  canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Photo processing is not available on this device.");
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", 0.78);
+}
+
+export default function App() {
+  const [workspace, setWorkspace] = useState<Workspace | null>(() => readWorkspace());
+  const [section, setSection] = useState<Section>("Dashboard");
+  const [setupOrg, setSetupOrg] = useState("");
+  const [setupSite, setSetupSite] = useState("");
+  const [setupLocation, setSetupLocation] = useState("");
+  const [plantName, setPlantName] = useState("");
+  const [plantLocation, setPlantLocation] = useState("");
+  const [plantCapacity, setPlantCapacity] = useState("");
+  const [plantEquipmentCategory, setPlantEquipmentCategory] = useState("");
+  const [plantEquipmentQuantity, setPlantEquipmentQuantity] = useState("1");
+  const [plantEquipmentPlan, setPlantEquipmentPlan] = useState<EquipmentPlan[]>([]);
+  const [configurePlantId, setConfigurePlantId] = useState("");
+  const [existingEquipmentCategory, setExistingEquipmentCategory] = useState("");
+  const [existingEquipmentQuantity, setExistingEquipmentQuantity] = useState("1");
+  const [showPlantForm, setShowPlantForm] = useState(false);
+  const [message, setMessage] = useState("");
+  const [storageReady, setStorageReady] = useState(false);
+  const [audits, setAudits] = useState<LocalAudit[]>([]);
+  const [showAuditForm, setShowAuditForm] = useState(false);
+  const [continueAfterCreate, setContinueAfterCreate] = useState(false);
+  const [auditType] = useState<AuditType>("Technical");
+  const [auditTitle, setAuditTitle] = useState("");
+  const [auditPlantId, setAuditPlantId] = useState("");
+  const [auditDate, setAuditDate] = useState(new Date().toISOString().slice(0, 10));
+  const [auditAuditor, setAuditAuditor] = useState("");
+  const [activeAudit, setActiveAudit] = useState<LocalAudit | null>(null);
+  const [summaryAudit, setSummaryAudit] = useState<LocalAudit | null>(null);
+  const [executionEquipment, setExecutionEquipment] = useState<AuditEquipment[]>([]);
+  const [selectedEquipmentId, setSelectedEquipmentId] = useState("");
+  const [equipmentName, setEquipmentName] = useState("");
+  const [equipmentType, setEquipmentType] = useState("");
+  const [checkpointDrafts, setCheckpointDrafts] = useState<Record<string, string>>({});
+  const [observations, setObservations] = useState<LocalObservation[]>([]);
+  const [observationDraft, setObservationDraft] = useState<{ auditId:string; checkpointId:string; findingType:FindingType; checkpointText:string; observationId?:string } | null>(null);
+  const [observationTitle, setObservationTitle] = useState("");
+  const [observationDescription, setObservationDescription] = useState("");
+  const [observationSeverity, setObservationSeverity] = useState("Minor");
+  const [observationResponsible, setObservationResponsible] = useState("");
+  const [observationAction, setObservationAction] = useState("");
+  const [observationTargetDate, setObservationTargetDate] = useState("");
+  const [observationActionPhotos, setObservationActionPhotos] = useState<string[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function startStorage() {
+      try {
+        await initializeLocalDatabase();
+        const stored = await loadWorkspace();
+        if (!cancelled && stored) setWorkspace(stored);
+      } catch (error) {
+        console.error("[Solar Audit] Local database startup failed:", error);
+        if (!cancelled) setMessage("Database could not be opened. Your existing device data has been preserved.");
+      } finally {
+        if (!cancelled) setStorageReady(true);
+      }
+    }
+    void startStorage();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!storageReady) return;
+    if (workspace) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(workspace));
+      void saveWorkspace(workspace).catch((error) => {
+        console.error("[Solar Audit] Workspace save failed:", error);
+        setMessage("Could not save workspace to the local database. Please keep the app open and retry.");
+      });
+    } else {
+      localStorage.removeItem(STORAGE_KEY);
+      void clearWorkspace().catch((error) => {
+        console.error("[Solar Audit] Workspace reset failed:", error);
+        setMessage("Workspace reset could not be fully saved to the local database.");
+      });
+    }
+  }, [workspace, storageReady]);
+
+  useEffect(() => {
+    if (!storageReady) return;
+    let cancelled = false;
+    void loadAudits().then((items) => {
+      if (!cancelled) setAudits(items);
+    }).catch((error) => {
+      console.error("[Solar Audit] Audit load failed:", error);
+      if (!cancelled) setMessage("Could not load saved audits. Existing data has been preserved.");
+    });
+    void loadObservations().then((items) => { if (!cancelled) setObservations(items); }).catch((error) => console.error("[Solar Audit] Observation load failed:", error));
+    return () => { cancelled = true; };
+  }, [storageReady]);
+
+  async function generateAuditReport(audit: LocalAudit) {
+    try {
+      setMessage(`Preparing report for â€œ${audit.title}â€â€¦`);
+      const execution = await loadAuditExecution(audit.id);
+      const allObservations = await loadObservations();
+      const auditObservations = allObservations.filter((item) => item.auditId === audit.id);
+      const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4", compress: true });
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const margin = 14;
+      const contentWidth = pageWidth - margin * 2;
+      let y = 17;
+      const ensureSpace = (height: number) => { if (y + height > pageHeight - 14) { pdf.addPage(); y = 16; } };
+      const line = (text: string, size = 9, bold = false, indent = 0) => {
+        pdf.setFont("helvetica", bold ? "bold" : "normal"); pdf.setFontSize(size);
+        const lines = pdf.splitTextToSize(text || "â€”", contentWidth - indent);
+        ensureSpace(lines.length * (size * 0.42) + 2);
+        pdf.text(lines, margin + indent, y); y += lines.length * (size * 0.42) + 2;
+      };
+      const heading = (text: string) => { ensureSpace(12); y += 3; pdf.setFont("helvetica", "bold"); pdf.setFontSize(12); pdf.text(text, margin, y); y += 6; pdf.setDrawColor(150, 165, 154); pdf.line(margin, y, pageWidth - margin, y); y += 4; };
+      const addPhoto = (photo: string, caption: string) => {
+        if (!photo || !photo.startsWith("data:image/")) return;
+        ensureSpace(66);
+        try {
+          const format = photo.startsWith("data:image/png") ? "PNG" : "JPEG";
+          pdf.addImage(photo, format, margin + 2, y, 48, 48, undefined, "FAST");
+          pdf.setFont("helvetica", "normal"); pdf.setFontSize(8);
+          const captionLines = pdf.splitTextToSize(caption, contentWidth - 55);
+          pdf.text(captionLines, margin + 54, y + 5);
+          y += 53;
+        } catch (error) { console.warn("Skipping a photo that could not be embedded in the PDF", error); }
+      };
+
+      pdf.setFont("helvetica", "bold"); pdf.setFontSize(19); pdf.text("SOLAR AUDIT REPORT", margin, y); y += 9;
+      pdf.setFontSize(13); pdf.text(audit.title || "Untitled audit", margin, y); y += 7;
+      pdf.setFont("helvetica", "normal"); pdf.setFontSize(9);
+      line(`Organization: ${current.organizationName}`);
+      line(`Site: ${current.siteName}${current.siteLocation ? ` â€” ${current.siteLocation}` : ""}`);
+      line(`Plant: ${audit.plantName || current.plants.find((p) => p.id === audit.plantId)?.name || "Not specified"}`);
+      line(`Audit type: ${audit.auditType}    Status: ${audit.status.replace("_", " ").toUpperCase()}`);
+      line(`Audit date: ${audit.auditDate || "Not specified"}    Auditor: ${audit.auditor || "Not specified"}`);
+      line(`Generated: ${new Date().toLocaleString()}`);
+
+      heading("EXECUTIVE SUMMARY");
+      const checkpoints = execution.flatMap((equipment) => equipment.checkpoints.map((checkpoint) => ({ equipment, checkpoint })));
+      const count = (result: string) => checkpoints.filter((item) => item.checkpoint.result === result).length;
+      line(`Equipment groups: ${execution.length}    Checkpoints: ${checkpoints.length}`);
+      line(`Compliant: ${count("C")}    Non-compliant: ${count("NC")}    Not applicable: ${count("NA")}    Opportunities for improvement: ${count("OFI")}`);
+      line(`Observations: ${auditObservations.length}    Open: ${auditObservations.filter((o) => o.status === "open").length}    Closed: ${auditObservations.filter((o) => o.status === "closed").length}`);
+
+      heading("CHECKLIST & INSPECTION EVIDENCE");
+      if (!execution.length) line("No equipment or checklist data has been saved for this audit.");
+      for (const equipment of execution) {
+        ensureSpace(10); pdf.setFont("helvetica", "bold"); pdf.setFontSize(10); pdf.text(`${equipment.name} â€” ${equipment.equipmentType}`, margin, y); y += 6;
+        if (!equipment.checkpoints.length) line("No checkpoints saved.", 8, false, 3);
+        for (const checkpoint of equipment.checkpoints) {
+          line(`[${checkpoint.result}] ${checkpoint.checkpointText}`, 9, true, 3);
+          if (checkpoint.remarks.trim()) line(`Remarks: ${checkpoint.remarks}`, 8, false, 6);
+          for (let i = 0; i < (checkpoint.photos ?? []).length; i++) addPhoto(checkpoint.photos[i], `${equipment.name} Â· ${checkpoint.checkpointText} Â· Inspection photo ${i + 1}`);
+          y += 1;
+        }
+      }
+
+      heading("OBSERVATIONS & CORRECTIVE-ACTION EVIDENCE");
+      if (!auditObservations.length) line("No NC or OFI observations are recorded for this audit.");
+      for (const observation of auditObservations) {
+        ensureSpace(22);
+        line(`${observation.findingType} â€” ${observation.title}`, 10, true);
+        line(`Checkpoint: ${observation.checkpointText}`);
+        line(`Status: ${observation.status.toUpperCase()}    Severity: ${observation.severity}    Target date: ${observation.targetDate || "Not set"}`);
+        line(`Responsible: ${observation.responsiblePerson || "Not assigned"}`);
+        if (observation.description) line(`Description: ${observation.description}`);
+        if (observation.actionText) line(`Action taken: ${observation.actionText}`);
+        for (let i = 0; i < (observation.photos ?? []).length; i++) addPhoto(observation.photos[i], `${observation.title} Â· Inspection photo ${i + 1}`);
+        for (let i = 0; i < (observation.actionPhotos ?? []).length; i++) addPhoto(observation.actionPhotos[i], `${observation.title} Â· Action-taken photo ${i + 1}`);
+        y += 2;
+      }
+      const safeName = (audit.title || "audit-report").replace(/[^a-z0-9-_]+/gi, "_").replace(/^_+|_+$/g, "").slice(0, 60) || "audit-report";
+      const filename = `${safeName}_${audit.auditDate || new Date().toISOString().slice(0, 10)}.pdf`;
+      const base64 = String(pdf.output("datauristring")).split(",")[1] ?? "";
+      if (base64 && (window as Window & { Capacitor?: { isNativePlatform?: () => boolean } }).Capacitor?.isNativePlatform?.()) {
+        const saved = await Filesystem.writeFile({ path: filename, data: base64, directory: Directory.Documents, recursive: true });
+        await Share.share({ title: `Audit report: ${audit.title}`, text: `Solar Audit report for ${audit.title}`, url: saved.uri, dialogTitle: "Share or save audit report" });
+        setMessage("PDF report generated. Use the share sheet to save or send it.");
+      } else {
+        pdf.save(filename);
+        setMessage("PDF report generated and downloaded.");
+      }
+    } catch (error) {
+      console.error("[Solar Audit] PDF report generation failed:", error);
+      setMessage(error instanceof Error ? `Could not generate report: ${error.message}` : "Could not generate the report. Please retry.");
+    }
+  }
+
+  const hasWorkspace = Boolean(workspace);
+  const plantsCount = workspace?.plants.length ?? 0;
+  const navItems: { label: Section; icon: string }[] = [
+    { label: "Dashboard", icon: "grid" },
+    { label: "Sites & Plants", icon: "site" },
+    { label: "Audits", icon: "audit" },
+    { label: "Observations", icon: "eye" },
+    { label: "Reports", icon: "report" },
+    { label: "Settings", icon: "settings" },
+  ];
+
+  function createWorkspace(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!setupOrg.trim() || !setupSite.trim()) return;
+    setWorkspace({
+      organizationName: setupOrg.trim(),
+      siteName: setupSite.trim(),
+      siteLocation: setupLocation.trim(),
+      plants: [],
+    });
+    setSection("Dashboard");
+    setMessage("Workspace created and saved on this device.");
+  }
+
+  function addEquipmentPlan() {
+    if (!plantEquipmentCategory) {
+      setMessage("Choose an equipment category first.");
+      return;
+    }
+    const quantity = Number.parseInt(plantEquipmentQuantity, 10);
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 500) {
+      setMessage("Equipment quantity must be between 1 and 500.");
+      return;
+    }
+    setPlantEquipmentPlan((current) => {
+      const existing = current.find((item) => item.category === plantEquipmentCategory);
+      if (existing) return current.map((item) => item.category === plantEquipmentCategory ? { ...item, quantity: item.quantity + quantity } : item);
+      return [...current, { category: plantEquipmentCategory, quantity }];
+    });
+    setPlantEquipmentCategory("");
+    setPlantEquipmentQuantity("1");
+  }
+
+  function addPlant(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!workspace || !plantName.trim()) return;
+    const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const equipment: PlantEquipment[] = [];
+    for (const plan of plantEquipmentPlan) {
+      for (let index = 1; index <= plan.quantity; index += 1) {
+        equipment.push({
+          id: `${id}-eq-${Math.random().toString(16).slice(2)}-${index}`,
+          category: plan.category,
+          name: `${plan.category} ${index}`,
+        });
+      }
+    }
+    const plant: Plant = {
+      id,
+      name: plantName.trim(),
+      location: plantLocation.trim(),
+      capacityMw: plantCapacity.trim(),
+      equipment,
+    };
+    setWorkspace({ ...workspace, plants: [...workspace.plants, plant] });
+    setPlantName("");
+    setPlantLocation("");
+    setPlantCapacity("");
+    setPlantEquipmentPlan([]);
+    setPlantEquipmentCategory("");
+    setPlantEquipmentQuantity("1");
+    setShowPlantForm(false);
+    setMessage(`Plant saved with ${equipment.length} registered equipment item(s).`);
+  }
+
+  function addEquipmentToExistingPlant(plantId: string) {
+    if (!workspace || !existingEquipmentCategory) {
+      setMessage("Choose an equipment category first.");
+      return;
+    }
+    const quantity = Number.parseInt(existingEquipmentQuantity, 10);
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 500) {
+      setMessage("Equipment quantity must be between 1 and 500.");
+      return;
+    }
+    const updatedPlants = workspace.plants.map((plant) => {
+      if (plant.id !== plantId) return plant;
+      const equipment = [...(plant.equipment ?? [])];
+      const existingNames = new Set(equipment.filter((item) => item.category === existingEquipmentCategory).map((item) => item.name));
+      let nextIndex = 1;
+      for (let added = 0; added < quantity; added += 1) {
+        while (existingNames.has(`${existingEquipmentCategory} ${nextIndex}`)) nextIndex += 1;
+        const name = `${existingEquipmentCategory} ${nextIndex}`;
+        equipment.push({ id: `${plantId}-eq-${Math.random().toString(16).slice(2)}`, category: existingEquipmentCategory, name });
+        existingNames.add(name);
+        nextIndex += 1;
+      }
+      return { ...plant, equipment };
+    });
+    setWorkspace({ ...workspace, plants: updatedPlants });
+    setExistingEquipmentCategory("");
+    setExistingEquipmentQuantity("1");
+    setMessage("Equipment inventory updated for this plant.");
+  }
+
+  function deletePlant(id: string) {
+    if (!workspace) return;
+    const plant = workspace.plants.find((item) => item.id === id);
+    if (!plant) return;
+    const linkedAudits = audits.filter((audit) => audit.plantId === id).length;
+    const confirmed = window.confirm(`Delete plant â€œ${plant.name}â€? This removes its equipment configuration. ${linkedAudits} existing audit(s) are linked to this plant; their saved results will not be intentionally deleted, but the plant link may be cleared. This action cannot be undone.`);
+    if (!confirmed) return;
+    setWorkspace({ ...workspace, plants: workspace.plants.filter((item) => item.id !== id) });
+    if (configurePlantId === id) setConfigurePlantId("");
+    if (auditPlantId === id) setAuditPlantId("");
+    setMessage(`Plant â€œ${plant.name}â€ deleted after confirmation.`);
+  }
+
+  function renamePlantEquipment(plantId: string, equipmentId: string, currentName: string) {
+    const nextName = window.prompt("Edit equipment name", currentName)?.trim();
+    if (!nextName || !workspace) return;
+    setWorkspace({ ...workspace, plants: workspace.plants.map((plant) => plant.id !== plantId ? plant : {
+      ...plant, equipment: (plant.equipment ?? []).map((item) => item.id === equipmentId ? { ...item, name: nextName } : item),
+    }) });
+    setMessage("Equipment name updated.");
+  }
+
+  function removePlantEquipment(plantId: string, equipmentId: string, name: string) {
+    if (!workspace) return;
+    if (!window.confirm(`Remove â€œ${name}â€ from this plant's registered equipment? Existing audit records will remain unchanged.`)) return;
+    setWorkspace({ ...workspace, plants: workspace.plants.map((plant) => plant.id !== plantId ? plant : {
+      ...plant, equipment: (plant.equipment ?? []).filter((item) => item.id !== equipmentId),
+    }) });
+    setMessage(`Equipment â€œ${name}â€ removed from plant inventory.`);
+  }
+
+  async function handleCreateAudit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!workspace || !auditPlantId || !auditTitle.trim() || !auditAuditor.trim() || !auditDate) return;
+    try {
+      const audit = await createAudit({
+        plantId: auditPlantId,
+        auditType,
+        title: auditTitle.trim(),
+        auditDate,
+        auditor: auditAuditor.trim(),
+      });
+      const refreshed = await loadAudits();
+      setAudits(refreshed);
+      setAuditTitle("");
+      setAuditAuditor("");
+      setAuditDate(new Date().toISOString().slice(0, 10));
+      setShowAuditForm(false);
+      setMessage(`Draft ${audit.auditType} audit saved on this device.`);
+      if (continueAfterCreate) { setContinueAfterCreate(false); await openAudit(audit); }
+    } catch (error) {
+      console.error("[Solar Audit] Audit create failed:", error);
+      setMessage(error instanceof Error ? error.message : "Could not save the audit. Please retry.");
+    }
+  }
+
+  async function openAudit(audit: LocalAudit) {
+    try {
+      let items = await loadAuditExecution(audit.id);
+      // Safety and Civil are site-level audits: create their checklist automatically, without equipment selection.
+      if (items.length === 0 && audit.status !== "submitted" && (audit.auditType === "Safety" || audit.auditType === "Civil")) {
+        const category = audit.auditType === "Safety" ? "Safety checklist" : "Civil checklist";
+        const checklist = audit.auditType === "Safety" ? SAFETY_CHECKLIST : [
+          "Inspect roads, walkways and access routes", "Inspect drainage and water logging", "Inspect boundary wall, fencing and gates",
+          "Inspect control room and building condition", "Inspect foundations and equipment plinths", "Inspect cable trenches and covers",
+          "Check housekeeping and waste management", "Inspect signage and civil safety provisions"
+        ];
+        const siteItem = await addAuditEquipment(audit.id, `${audit.auditType} Site Checklist`, category);
+        const checkpoints: AuditCheckpoint[] = [];
+        for (const text of checklist) checkpoints.push(await addAuditCheckpoint(audit.id, siteItem.id, text));
+        items = [{ ...siteItem, checkpoints }];
+      }
+      if (audit.status === "submitted") {
+        setActiveAudit(null);
+        setSummaryAudit(audit);
+        setExecutionEquipment(items);
+        setSelectedEquipmentId(items.length ? items[0].id : "");
+        setSection("Audits");
+        setMessage("");
+        return;
+      }
+      setSummaryAudit(null);
+      setActiveAudit(audit);
+      setExecutionEquipment(items);
+      setSelectedEquipmentId(items.length ? items[0].id : "");
+      setCheckpointDrafts({});
+      setEquipmentName("");
+      setEquipmentType("");
+      setSection("Audits");
+      setMessage("");
+    } catch (error) {
+      console.error("[Solar Audit] Audit execution load failed:", error);
+      setMessage("Could not open this audit. Your saved data has been preserved.");
+    } finally {
+      
+    }
+  }
+
+  async function switchAuditType(nextType: AuditType) {
+    if (!activeAudit || activeAudit.status === "submitted" || activeAudit.auditType === nextType) return;
+    if (!window.confirm(`Switch this audit to ${nextType}? Existing equipment and checkpoint results will remain saved.`)) return;
+    try {
+      await updateAuditType(activeAudit.id, nextType);
+      const refreshed = await loadAudits();
+      setAudits(refreshed);
+      const updatedAudit = refreshed.find((item) => item.id === activeAudit.id) ?? { ...activeAudit, auditType: nextType };
+      setActiveAudit(updatedAudit);
+      setEquipmentType("");
+      setEquipmentName("");
+
+      // Safety and Civil are site-level audits: create/load their checklist immediately on switch.
+      if (nextType === "Safety" || nextType === "Civil") {
+        const category = nextType === "Safety" ? "Safety checklist" : "Civil checklist";
+        const checklist = nextType === "Safety" ? SAFETY_CHECKLIST : [
+          "Inspect roads, walkways and access routes", "Inspect drainage and water logging", "Inspect boundary wall, fencing and gates",
+          "Inspect control room and building condition", "Inspect foundations and equipment plinths", "Inspect cable trenches and covers",
+          "Check housekeeping and waste management", "Inspect signage and civil safety provisions"
+        ];
+        let items = await loadAuditExecution(activeAudit.id);
+        let siteItem = items.find((item) => item.equipmentType === category || item.name === `${nextType} Site Checklist`);
+        if (!siteItem) {
+          siteItem = await addAuditEquipment(activeAudit.id, `${nextType} Site Checklist`, category);
+          const checkpoints: AuditCheckpoint[] = [];
+          for (const text of checklist) checkpoints.push(await addAuditCheckpoint(activeAudit.id, siteItem.id, text));
+          siteItem = { ...siteItem, checkpoints };
+          items = [...items, siteItem];
+        } else if (siteItem.checkpoints.length === 0) {
+          const checkpoints: AuditCheckpoint[] = [];
+          for (const text of checklist) checkpoints.push(await addAuditCheckpoint(activeAudit.id, siteItem.id, text));
+          siteItem = { ...siteItem, checkpoints };
+          items = items.map((item) => item.id === siteItem!.id ? siteItem! : item);
+        }
+        setExecutionEquipment(items);
+        setSelectedEquipmentId(siteItem.id);
+      } else {
+        const items = await loadAuditExecution(activeAudit.id);
+        setExecutionEquipment(items);
+        setSelectedEquipmentId("");
+      }
+      setMessage(`${nextType} checklist loaded. Existing results were retained.`);
+    } catch (error) {
+      console.error("[Solar Audit] Audit type switch failed:", error);
+      setMessage(error instanceof Error ? error.message : "Could not switch audit section.");
+    }
+  }
+
+  async function handleAddEquipment(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!activeAudit || !equipmentName.trim() || !equipmentType) return;
+    try {
+      const item = await addAuditEquipment(activeAudit.id, equipmentName, equipmentType);
+      let checkpointTexts: string[] = [];
+      if (activeAudit.auditType === "Technical") {
+        checkpointTexts = TECHNICAL_CHECKLISTS[equipmentType] ?? [];
+      } else if (activeAudit.auditType === "Safety" && equipmentType === "Safety checklist") {
+        checkpointTexts = SAFETY_CHECKLIST;
+      }
+      const createdCheckpoints: AuditCheckpoint[] = [];
+      for (const text of checkpointTexts) {
+        createdCheckpoints.push(await addAuditCheckpoint(activeAudit.id, item.id, text));
+      }
+      const itemWithCheckpoints = { ...item, checkpoints: createdCheckpoints };
+      setExecutionEquipment((current) => [...current, itemWithCheckpoints]);
+      setSelectedEquipmentId(item.id);
+      setActiveAudit({ ...activeAudit, status: "in_progress", updatedAt: new Date().toISOString() });
+      setEquipmentName("");
+      setEquipmentType("");
+      const refreshed = await loadAudits();
+      setAudits(refreshed);
+      setMessage(checkpointTexts.length
+        ? `Equipment saved with ${checkpointTexts.length} predefined checkpoints.`
+        : "Equipment saved. No predefined checklist was available for this category; you can add checkpoints manually.");
+    } catch (error) {
+      console.error("[Solar Audit] Equipment save failed:", error);
+      setMessage(error instanceof Error ? error.message : "Could not save equipment.");
+    }
+  }
+
+  async function handleAddCheckpoint(event: React.FormEvent<HTMLFormElement>, equipment: AuditEquipment) {
+    event.preventDefault();
+    const text = checkpointDrafts[equipment.id]?.trim();
+    if (!activeAudit || !text) return;
+    try {
+      const checkpoint = await addAuditCheckpoint(activeAudit.id, equipment.id, text);
+      setExecutionEquipment((current) => current.map((eq) => eq.id === equipment.id ? { ...eq, checkpoints: [...eq.checkpoints, checkpoint] } : eq));
+      setCheckpointDrafts((current) => ({ ...current, [equipment.id]: "" }));
+      const refreshed = await loadAudits();
+      setAudits(refreshed);
+      setActiveAudit({ ...activeAudit, status: "in_progress", updatedAt: new Date().toISOString() });
+      setMessage("Checkpoint added.");
+    } catch (error) {
+      console.error("[Solar Audit] Checkpoint save failed:", error);
+      setMessage(error instanceof Error ? error.message : "Could not save checkpoint.");
+    }
+  }
+
+  async function handleCheckpointChange(equipmentId: string, checkpoint: AuditCheckpoint, changes: Partial<AuditCheckpoint>) {
+    if (!activeAudit) return;
+    const updated = { ...checkpoint, ...changes };
+    setExecutionEquipment((current) => current.map((eq) => eq.id === equipmentId
+      ? { ...eq, checkpoints: eq.checkpoints.map((cp) => cp.id === checkpoint.id ? updated : cp) }
+      : eq));
+    try {
+      await updateAuditCheckpoint(activeAudit.id, updated);
+      setMessage("Checkpoint saved locally.");
+    } catch (error) {
+      console.error("[Solar Audit] Checkpoint save failed:", error);
+      setMessage("Checkpoint could not be saved. Please retry.");
+    }
+  }
+
+  async function takeCheckpointPhoto(equipmentId: string, checkpoint: AuditCheckpoint) {
+    if (!activeAudit || activeAudit.status === "submitted") return;
+    try {
+      const photo = await Camera.getPhoto({
+        quality: 90,
+        allowEditing: false,
+        resultType: CameraResultType.DataUrl,
+        source: CameraSource.Camera,
+        direction: CameraDirection.Rear,
+        correctOrientation: true,
+        saveToGallery: false,
+      });
+      if (!photo.dataUrl) throw new Error("The camera did not return an image.");
+      const response = await fetch(photo.dataUrl);
+      const blob = await response.blob();
+      const file = new File([blob], `inspection-${Date.now()}.jpg`, { type: blob.type || "image/jpeg" });
+      await handleCheckpointPhotos(equipmentId, checkpoint, [file]);
+    } catch (error) {
+      // Closing the native camera is not an error the user needs to be warned about.
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/cancel|cancelled|canceled/i.test(message)) {
+        console.error("[Solar Audit] Native camera failed:", error);
+        setMessage("Could not open the camera. Check camera permission and try again.");
+      }
+    }
+  }
+
+  async function handleCheckpointPhotos(equipmentId: string, checkpoint: AuditCheckpoint, files: FileList | File[] | null) {
+    if (!activeAudit || !files?.length) return;
+    if (activeAudit.status === "submitted") return;
+    try {
+      const currentPhotos = checkpoint.photos ?? [];
+      const incoming = await Promise.all(Array.from(files).map(photoFileToDataUrl));
+      const updated = { ...checkpoint, photos: [...currentPhotos, ...incoming] };
+      await updateAuditCheckpoint(activeAudit.id, updated);
+      setExecutionEquipment((current) => current.map((eq) => eq.id === equipmentId
+        ? { ...eq, checkpoints: eq.checkpoints.map((cp) => cp.id === checkpoint.id ? updated : cp) }
+        : eq));
+      setMessage(`${incoming.length} photo${incoming.length === 1 ? "" : "s"} saved on this device.`);
+    } catch (error) {
+      console.error("[Solar Audit] Photo capture/save failed:", error);
+      setMessage("Photo could not be saved. Please try again with a smaller photo.");
+    }
+  }
+
+  async function removeCheckpointPhoto(equipmentId: string, checkpoint: AuditCheckpoint, photoIndex: number) {
+    if (!activeAudit || activeAudit.status === "submitted") return;
+    const updated = { ...checkpoint, photos: (checkpoint.photos ?? []).filter((_, index) => index !== photoIndex) };
+    try {
+      await updateAuditCheckpoint(activeAudit.id, updated);
+      setExecutionEquipment((current) => current.map((eq) => eq.id === equipmentId
+        ? { ...eq, checkpoints: eq.checkpoints.map((cp) => cp.id === checkpoint.id ? updated : cp) }
+        : eq));
+      setMessage("Photo removed.");
+    } catch (error) {
+      console.error("[Solar Audit] Photo removal failed:", error);
+      setMessage("Photo could not be removed. Please retry.");
+    }
+  }
+
+  async function submitAudit() {
+    if (!activeAudit) return;
+    if (!window.confirm("Submit this audit? NC and OFI checkpoints will be added to Observations for follow-up.")) return;
+    try {
+      const existing = await loadObservations();
+      let created = 0;
+      for (const equipment of executionEquipment) {
+        for (const checkpoint of equipment.checkpoints) {
+          if (checkpoint.result !== "NC" && checkpoint.result !== "OFI") continue;
+          const duplicate = existing.some((o) => o.auditId === activeAudit.id && o.checkpointId === checkpoint.id && o.findingType === checkpoint.result);
+          if (duplicate) continue;
+          await createObservation({
+            auditId: activeAudit.id,
+            checkpointId: checkpoint.id,
+            findingType: checkpoint.result as FindingType,
+            title: checkpoint.checkpointText,
+            description: checkpoint.remarks || "",
+            severity: "Minor",
+            responsiblePerson: "",
+            actionText: "",
+            targetDate: "",
+          });
+          created++;
+        }
+      }
+      await markAuditSubmitted(activeAudit.id);
+      const refreshedAudits = await loadAudits();
+      setAudits(refreshedAudits);
+      const submitted = refreshedAudits.find((a) => a.id === activeAudit.id) ?? { ...activeAudit, status: "submitted" as const };
+      setActiveAudit(null);
+      setSummaryAudit(submitted);
+      setObservations(await loadObservations());
+      setMessage(`Audit submitted and locked. ${created} observation(s) created from NC/OFI checkpoints.`);
+    } catch (error) {
+      console.error("[Solar Audit] Audit submission failed:", error);
+      setMessage("Could not submit the audit. Your saved audit data has been preserved.");
+    }
+  }
+
+  async function addObservationActionPhoto(file: File) {
+    try { setObservationActionPhotos((current) => current); const photo = await photoFileToDataUrl(file); setObservationActionPhotos((current) => [...current, photo]); }
+    catch (error) { console.error("[Solar Audit] Action photo processing failed:", error); setMessage("Action photo could not be processed. Please try another image."); }
+  }
+
+  async function takeObservationActionPhoto() {
+    try {
+      const photo = await Camera.getPhoto({ quality: 90, allowEditing: false, resultType: CameraResultType.DataUrl, source: CameraSource.Camera, direction: CameraDirection.Rear, correctOrientation: true, saveToGallery: false });
+      if (!photo.dataUrl) return;
+      const response = await fetch(photo.dataUrl); const blob = await response.blob();
+      await addObservationActionPhoto(new File([blob], `action-${Date.now()}.jpg`, { type: blob.type || "image/jpeg" }));
+    } catch (error) { const msg = error instanceof Error ? error.message : String(error); if (!/cancel|cancelled|canceled/i.test(msg)) { console.error("[Solar Audit] Action camera failed:", error); setMessage("Could not open the camera. Check camera permission and try again."); } }
+  }
+
+  async function handleCreateObservation(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!observationDraft || !observationTitle.trim()) return;
+    try {
+      if (observationDraft.observationId) {
+        await updateObservationDetails({ id: observationDraft.observationId, title: observationTitle, description: observationDescription, severity: observationSeverity, responsiblePerson: observationResponsible, actionText: observationAction, targetDate: observationTargetDate });
+        await saveObservationActionPhotos(observationDraft.observationId, observationActionPhotos);
+      } else {
+        const newObservationId = await createObservation({ ...observationDraft, title: observationTitle, description: observationDescription, severity: observationSeverity, responsiblePerson: observationResponsible, actionText: observationAction, targetDate: observationTargetDate });
+        await saveObservationActionPhotos(newObservationId, observationActionPhotos);
+      }
+      setObservations(await loadObservations()); setObservationDraft(null); setObservationTitle(""); setObservationDescription(""); setObservationResponsible(""); setObservationAction(""); setObservationTargetDate(""); setObservationActionPhotos([]);
+      setMessage("Observation saved locally.");
+    } catch (error) { console.error("[Solar Audit] Observation save failed:", error); setMessage("Could not save observation. Your audit data has been preserved."); }
+  }
+
+  function editObservation(o: LocalObservation) {
+    setObservationDraft({ auditId: o.auditId, checkpointId: o.checkpointId ?? "", findingType: o.findingType, checkpointText: o.checkpointText, observationId: o.id });
+    setObservationTitle(o.title);
+    setObservationDescription(o.description);
+    setObservationSeverity(o.severity || "Minor");
+    setObservationResponsible(o.responsiblePerson);
+    setObservationAction(o.actionText);
+    setObservationTargetDate(o.targetDate);
+    setObservationActionPhotos(o.actionPhotos ?? []);
+  }
+
+  async function handleObservationStatus(observation: LocalObservation, status: "open" | "closed") {
+    try { await updateObservationStatus(observation.id, status); setObservations(await loadObservations()); setMessage(status === "closed" ? "Observation closed." : "Observation reopened."); }
+    catch (error) { console.error("[Solar Audit] Observation status update failed:", error); setMessage("Could not update observation status."); }
+  }
+
+  function resetWorkspace() {
+    if (!window.confirm("Reset this local workspace? This removes the organization, site and plant details stored on this device.")) return;
+    setWorkspace(null);
+    setSetupOrg("");
+    setSetupSite("");
+    setSetupLocation("");
+    setSection("Dashboard");
+    setMessage("Local workspace reset.");
+  }
+
+  const pageTitle = useMemo(() => section, [section]);
+
+  if (!hasWorkspace) {
+    return (
+      <main className="setup-page">
+        <div className="setup-brand"><div className="brand-mark"><Icon name="sun" /></div><div><span className="eyebrow">FIELD OPERATIONS</span><h1>Solar Audit<span> Mobile</span></h1></div></div>
+        <div className="setup-layout">
+          <section className="setup-intro">
+            <span className="pill"><span className="status-dot" /> NEW WORKSPACE</span>
+            <h2>A clean start for every site audit.</h2>
+            <p>Set up your organization and first site. You choose what gets addedâ€”nothing is preloaded.</p>
+            <div className="setup-points"><div><span>01</span><div><b>Create your workspace</b><small>Enter your organization and site details.</small></div></div><div><span>02</span><div><b>Add your plants</b><small>Build your plant list when you're ready.</small></div></div><div><span>03</span><div><b>Prepare for audits</b><small>Audit capture and server sync will be connected in the next stages.</small></div></div></div>
+          </section>
+          <form className="setup-card" onSubmit={createWorkspace}>
+            <div className="card-kicker">FIRST-TIME SETUP</div><h3>Set up your workspace</h3><p className="muted">Start with the basics. You can change these later.</p>
+            <label>Organization name <span>*</span><input value={setupOrg} onChange={(e) => setSetupOrg(e.target.value)} placeholder="Enter organization name" required /></label>
+            <label>First site name <span>*</span><input value={setupSite} onChange={(e) => setSetupSite(e.target.value)} placeholder="Enter site name" required /></label>
+            <label>Site location <small>OPTIONAL</small><input value={setupLocation} onChange={(e) => setSetupLocation(e.target.value)} placeholder="City, state or site address" /></label>
+            <button className="primary-button full-button" type="submit">Create workspace <Icon name="arrow" /></button>
+            <div className="local-note"><Icon name="cloud" /><span><b>Device-only setup</b><br />These details are saved in this app on this device. Server backup and multi-user access are not connected yet.</span></div>
+          </form>
+        </div>
+        <footer className="setup-footer">SOLAR AUDIT MOBILE <span>â€¢</span> FRESH WORKSPACE</footer>
+      </main>
+    );
+  }
+
+  const current = workspace as Workspace;
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="sidebar-brand"><div className="brand-mark"><Icon name="sun" /></div><div><strong>Solar Audit</strong><small>Mobile workspace</small></div></div>
+        <div className="workspace-label">WORKSPACE</div>
+        <div className="workspace-mini"><div className="workspace-avatar">{current.organizationName.slice(0, 1).toUpperCase()}</div><div className="workspace-copy"><b>{current.organizationName}</b><small>{current.siteName}</small></div></div>
+        <nav className="side-nav" aria-label="Main navigation">
+          {navItems.map((item) => <button key={item.label} className={section === item.label ? "nav-item active" : "nav-item"} onClick={() => { setSection(item.label); setMessage(""); }}><Icon name={item.icon} /><span>{item.label}</span>{item.label === "Audits" && <em>{audits.length}</em>}</button>)}
+        </nav>
+        <div className="sidebar-bottom"><div className="sync-mini"><span className="status-dot amber" /><div><b>Local mode</b><small>Server sync not connected</small></div></div><small className="version-label">Fresh workspace Â· v0.1</small></div>
+      </aside>
+
+      <main className="main-panel">
+        <header className="topbar"><div><div className="breadcrumb">Workspace <span>/</span> {pageTitle}</div><h1>{pageTitle}</h1></div><div className="topbar-actions"><span className="offline-chip"><span className="status-dot amber" /> Local only</span><div className="profile-badge">{current.organizationName.slice(0, 1).toUpperCase()}</div></div></header>
+        {message && <div className="toast-message" role="status">{message}<button onClick={() => setMessage("")} aria-label="Dismiss">Ã—</button></div>}
+
+        {section === "Dashboard" && <div className="page-content">
+          <section className="welcome-banner"><div><span className="eyebrow light">WORKSPACE OVERVIEW</span><h2>Welcome to your workspace.</h2><p>Your new audit environment is ready to configure. Add plant details to get started.</p><button className="banner-button" onClick={() => { setSection("Sites & Plants"); setShowPlantForm(true); }}>Add your first plant <Icon name="arrow" /></button></div><div className="banner-art"><div className="sun-disc" /><div className="solar-panel panel-one" /><div className="solar-panel panel-two" /><div className="horizon" /></div></section>
+          <div className="section-heading"><div><h2>Workspace snapshot</h2><p>Only records you create in this fresh workspace will appear here.</p></div><span className="date-tag">LIVE LOCAL DATA</span></div>
+          <div className="metric-grid"><div className="metric-card"><div className="metric-top"><span>Plants configured</span><div className="metric-icon"><Icon name="plant" /></div></div><strong>{plantsCount}</strong><small>In this workspace</small></div><div className="metric-card"><div className="metric-top"><span>Audits created</span><div className="metric-icon"><Icon name="audit" /></div></div><strong>{audits.length}</strong><small>{audits.length ? "Saved in this workspace" : "No audits yet"}</small></div><div className="metric-card"><div className="metric-top"><span>Open observations</span><div className="metric-icon"><Icon name="eye" /></div></div><strong>0</strong><small>No observations yet</small></div><div className="metric-card"><div className="metric-top"><span>Reports generated</span><div className="metric-icon"><Icon name="report" /></div></div><strong>0</strong><small>No reports yet</small></div></div>
+          <div className="dashboard-lower"><section className="content-card"><div className="card-heading"><div><h3>Get started</h3><p>Set up the essentials for your new workspace.</p></div><span className="step-count">{plantsCount ? "2" : "1"} of 3</span></div><div className="checklist-row done"><div className="check-circle">âœ“</div><div><b>Create organization and site</b><small>{current.siteName}{current.siteLocation ? ` Â· ${current.siteLocation}` : ""}</small></div><span className="complete-tag">COMPLETE</span></div><div className={plantsCount ? "checklist-row done" : "checklist-row"}><div className="check-circle">{plantsCount ? "âœ“" : "2"}</div><div><b>Add plant details</b><small>{plantsCount ? `${plantsCount} plant${plantsCount === 1 ? "" : "s"} added` : "Add the plants that belong to this site."}</small></div><button className="text-button" onClick={() => { setSection("Sites & Plants"); setShowPlantForm(true); }}>{plantsCount ? "Manage" : "Add plant"} <Icon name="arrow" /></button></div><div className="checklist-row"><div className="check-circle">3</div><div><b>Connect audit services</b><small>Audit drafts are ready. Checklist execution, photos and sync are next.</small></div><span className="pending-tag">PENDING</span></div></section>
+          <section className="content-card site-summary"><div className="card-heading"><div><h3>Current site</h3><p>Your active workspace location</p></div><div className="metric-icon"><Icon name="site" /></div></div><div className="site-name-row"><div className="site-pin"><Icon name="site" /></div><div><b>{current.siteName}</b><small>{current.siteLocation || "No location added"}</small></div></div><div className="summary-divider" /><div className="summary-line"><span>Organization</span><b>{current.organizationName}</b></div><div className="summary-line"><span>Plants</span><b>{plantsCount}</b></div><button className="secondary-button full-button" onClick={() => setSection("Settings")}>Workspace settings <Icon name="arrow" /></button></section></div>
+        </div>}
+
+        {section === "Sites & Plants" && <div className="page-content"><div className="section-heading"><div><h2>Sites & plants</h2><p>Manage the plant list for this fresh workspace.</p></div><button className="primary-button" onClick={() => setShowPlantForm((v) => !v)}><Icon name="plus" /> Add plant</button></div><section className="content-card site-details-card"><div className="card-heading"><div><span className="card-kicker">ACTIVE SITE</span><h3>{current.siteName}</h3><p>{current.siteLocation || "No location provided"}</p></div><div className="site-status">Active workspace</div></div><div className="summary-divider" /><div className="summary-line"><span>Organization</span><b>{current.organizationName}</b></div><div className="summary-line"><span>Plants registered</span><b>{plantsCount}</b></div></section>
+          {showPlantForm && <form className="content-card plant-form" onSubmit={addPlant}><div className="card-heading"><div><h3>Add a plant</h3><p>Enter only the details you know. No sample data is added.</p></div><button type="button" className="close-button" onClick={() => setShowPlantForm(false)} aria-label="Close">Ã—</button></div><div className="form-grid"><label>Plant name <span>*</span><input value={plantName} onChange={(e) => setPlantName(e.target.value)} placeholder="e.g. Plant name" required /></label><label>Plant location<input value={plantLocation} onChange={(e) => setPlantLocation(e.target.value)} placeholder="Optional location" /></label><label>Capacity (MW)<input type="number" min="0" step="any" value={plantCapacity} onChange={(e) => setPlantCapacity(e.target.value)} placeholder="Optional capacity" /></label></div>
+            <div className="plant-equipment-setup">
+              <h4>Equipment inventory</h4>
+              <p>Add the equipment this plant contains. Names are generated automatically and can be customized later.</p>
+              <div className="form-grid">
+                <label>Equipment category<select value={plantEquipmentCategory} onChange={(e) => setPlantEquipmentCategory(e.target.value)}><option value="">Select category</option>{TECHNICAL_CATEGORIES.map((category) => <option key={category} value={category}>{category}</option>)}<option value="Safety checklist">Safety checklist (site-level)</option><option value="Other / Custom">Other / Custom</option></select></label>
+                <label>Quantity<input type="number" min="1" max="500" value={plantEquipmentQuantity} onChange={(e) => setPlantEquipmentQuantity(e.target.value)} /></label>
+              </div>
+              <button type="button" className="secondary-button" onClick={addEquipmentPlan}>Add category and quantity</button>
+              {plantEquipmentPlan.length > 0 && <div className="inventory-plan-list">{plantEquipmentPlan.map((item) => <div className="inventory-plan-row" key={item.category}><span>{item.category}</span><b>{item.quantity}</b><button type="button" className="delete-button" onClick={() => setPlantEquipmentPlan((current) => current.filter((entry) => entry.category !== item.category))} aria-label={`Remove ${item.category}`}>Ã—</button></div>)}</div>}
+            </div>
+            <div className="form-actions"><button type="button" className="secondary-button" onClick={() => setShowPlantForm(false)}>Cancel</button><button className="primary-button" type="submit">Save plant</button></div></form>}
+          <div className="section-heading compact-heading"><div><h2>Plant register</h2><p>{plantsCount} plant{plantsCount === 1 ? "" : "s"} added</p></div></div>
+          {plantsCount === 0 ? <div className="empty-state"><div className="empty-icon"><Icon name="plant" /></div><h3>No plants added yet</h3><p>Your plant register is empty by design. Add your first plant when you're ready.</p><button className="primary-button" onClick={() => setShowPlantForm(true)}><Icon name="plus" /> Add first plant</button></div> : <div className="plant-list">{current.plants.map((plant) => <div className="plant-record" key={plant.id}><article className="plant-row"><div className="plant-symbol"><Icon name="plant" /></div><div className="plant-details"><b>{plant.name}</b><small>{plant.location || "Location not provided"}</small><small>{(plant.equipment ?? []).length} registered equipment item(s)</small></div><div className="plant-capacity"><small>CAPACITY</small><b>{plant.capacityMw ? `${plant.capacityMw} MW` : "â€”"}</b></div><button type="button" className="secondary-button" onClick={() => setConfigurePlantId((currentId) => currentId === plant.id ? "" : plant.id)}>{configurePlantId === plant.id ? "Done" : "Configure equipment"}</button><button className="delete-button" onClick={() => deletePlant(plant.id)} aria-label={`Delete ${plant.name}`} title="Delete plant">Ã—</button></article>
+              {configurePlantId === plant.id && <div className="plant-inventory-editor"><h4>Equipment inventory Â· {plant.name}</h4><div className="inventory-category-groups">{Object.entries((plant.equipment ?? []).reduce<Record<string, PlantEquipment[]>>((groups, item) => { const category = item.category || "Other / Custom"; (groups[category] ??= []).push(item); return groups; }, {})).length > 0 ? Object.entries((plant.equipment ?? []).reduce<Record<string, PlantEquipment[]>>((groups, item) => { const category = item.category || "Other / Custom"; (groups[category] ??= []).push(item); return groups; }, {})).map(([category, items]) => <details className="inventory-category-group" key={category}><summary className="inventory-category-summary-row"><span className="inventory-category-check" aria-label="Registered">âœ“</span><span className="inventory-category-name">{category}</span><b className="inventory-category-count">{items.length}</b><span className="inventory-category-chevron" aria-hidden="true">âŒ„</span></summary><div className="inventory-category-items">{items.map((item) => <div className="inventory-item-admin-row" key={item.id}><span>{item.name}</span><button type="button" className="text-button" onClick={() => renamePlantEquipment(plant.id, item.id, item.name)}>Rename</button><button type="button" className="delete-button" onClick={() => removePlantEquipment(plant.id, item.id, item.name)} aria-label={`Remove ${item.name}`}>Ã—</button></div>)}</div></details>) : <p>No equipment registered yet.</p>}</div><div className="form-grid"><label>Category<select value={existingEquipmentCategory} onChange={(e) => setExistingEquipmentCategory(e.target.value)}><option value="">Select category</option>{TECHNICAL_CATEGORIES.map((category) => <option key={category} value={category}>{category}</option>)}<option value="Safety checklist">Safety checklist (site-level)</option><option value="Other / Custom">Other / Custom</option></select></label><label>Quantity to add<input type="number" min="1" max="500" value={existingEquipmentQuantity} onChange={(e) => setExistingEquipmentQuantity(e.target.value)} /></label></div><button type="button" className="primary-button" onClick={() => addEquipmentToExistingPlant(plant.id)}>Add registered equipment</button></div>}
+            </div>)}</div>}
+        </div>}
+
+        {section === "Audits" && <div className="page-content">
+          <div className="section-heading"><div><h2>Audit register</h2><p>Create and manage audit drafts for your registered plants.</p></div>{!activeAudit && !summaryAudit && <button className="primary-button" onClick={() => setShowAuditForm((v) => !v)} disabled={current.plants.length === 0}><Icon name="plus" /> Create audit</button>}</div>
+          {current.plants.length === 0 && <div className="inline-notice">Add at least one plant before creating an audit.</div>}
+          {showAuditForm && <form className="content-card plant-form" onSubmit={handleCreateAudit}>
+            <div className="card-heading"><div><h3>New audit</h3><p>Create one audit with Technical, Safety, and Civil sections.</p></div><button type="button" className="close-button" onClick={() => setShowAuditForm(false)} aria-label="Close">Ã—</button></div>
+            <div className="form-grid">
+              <label>Plant <span>*</span><select value={auditPlantId} onChange={(e) => setAuditPlantId(e.target.value)} required><option value="">Select a plant</option>{current.plants.map((plant) => <option key={plant.id} value={plant.id}>{plant.name}</option>)}</select></label>
+              <label>Audit title <span>*</span><input value={auditTitle} onChange={(e) => setAuditTitle(e.target.value)} placeholder="e.g. Monthly site audit" required /></label>
+              <label>Audit date <span>*</span><input type="date" value={auditDate} onChange={(e) => setAuditDate(e.target.value)} required /></label>
+              <label>Auditor name <span>*</span><input value={auditAuditor} onChange={(e) => setAuditAuditor(e.target.value)} placeholder="Enter auditor name" required /></label>
+            </div>
+            <div className="form-actions"><button type="button" className="secondary-button" onClick={() => setShowAuditForm(false)}>Cancel</button><button className="secondary-button" type="submit" onClick={() => setContinueAfterCreate(false)}>Save draft</button><button className="primary-button" type="submit" onClick={() => setContinueAfterCreate(true)}>Continue audit</button></div>
+          </form>}
+          {summaryAudit && <section className="content-card audit-summary-page">
+            <div className="card-heading"><div><span className="card-kicker">AUDIT SUMMARY</span><h3>{summaryAudit.title}</h3><p>{summaryAudit.plantName || current.plants.find((p) => p.id === summaryAudit.plantId)?.name || "Plant"} Â· {summaryAudit.auditType} Â· {summaryAudit.auditDate}</p></div><span className="audit-status">Submitted Â· Locked</span></div>
+            <div className="execution-summary"><span>Auditor: <b>{summaryAudit.auditor}</b></span><span>Equipment items: <b>{executionEquipment.length}</b></span><span>Checkpoints: <b>{executionEquipment.reduce((n, eq) => n + eq.checkpoints.length, 0)}</b></span><span>NC: <b>{executionEquipment.reduce((n, eq) => n + eq.checkpoints.filter(cp => cp.result === "NC").length, 0)}</b></span><span>OFI: <b>{executionEquipment.reduce((n, eq) => n + eq.checkpoints.filter(cp => cp.result === "OFI").length, 0)}</b></span></div>
+            <h4>Observations by equipment category</h4>
+            {(() => { const auditObs = observations.filter(o => o.auditId === summaryAudit.id); const groups = new Map<string, LocalObservation[]>(); auditObs.forEach(o => { const eq = executionEquipment.find(e => e.checkpoints.some(cp => cp.id === o.checkpointId)); const category = eq?.equipmentType || (summaryAudit.auditType === "Safety" ? "Safety" : summaryAudit.auditType === "Civil" ? "Civil" : "Other / Unmapped"); groups.set(category, [...(groups.get(category) ?? []), o]); }); return auditObs.length === 0 ? <p>No NC or OFI observations were recorded for this audit.</p> : [...groups.entries()].map(([category, items]) => <details className="summary-observation-group" key={category}><summary>{category} <span>{items.length} observation(s)</span></summary><div>{items.map(o => <article key={o.id} className="summary-observation"><b>{o.title}</b><p>{o.checkpointText}</p><small>{o.findingType} Â· {o.severity} Â· {o.status}</small></article>)}</div></details>); })()}
+            <div className="form-actions"><button className="secondary-button" onClick={() => { setSummaryAudit(null); setActiveAudit(null); }}>Back to audit register</button><button className="primary-button" onClick={() => setSection("Observations")}>View all observations</button></div>
+          </section>}
+          {!summaryAudit && activeAudit && <section className="content-card execution-panel">
+            <div className="card-heading"><div><span className="card-kicker">AUDIT EXECUTION</span><h3>{activeAudit.title}</h3><p>{activeAudit.plantName || current.plants.find((p) => p.id === activeAudit.plantId)?.name} Â· {activeAudit.auditType} Â· {activeAudit.auditDate}</p></div><button type="button" className="secondary-button" onClick={() => setActiveAudit(null)}>Back to register</button></div>
+            <div className="audit-mode-switch" role="group" aria-label="Audit type"><span>Audit section</span>{(["Technical", "Safety", "Civil"] as AuditType[]).map((type) => <button type="button" key={type} className={activeAudit.auditType === type ? "active" : ""} disabled={activeAudit.status === "submitted" || activeAudit.auditType === type} onClick={() => void switchAuditType(type)}>{type}</button>)}</div><div className="execution-summary"><span>Status: <b>{activeAudit.status.replace("_", " ")}</b></span><span>{executionEquipment.length} equipment item(s)</span><span>{executionEquipment.reduce((n, eq) => n + eq.checkpoints.length, 0)} checkpoint(s)</span></div>
+            {activeAudit.auditType === "Technical" && <form className="equipment-form" onSubmit={handleAddEquipment}>
+              <h4>Add equipment</h4>
+              <div className="form-grid"><label>Equipment category <span>*</span><select value={equipmentType} onChange={(e) => { setEquipmentType(e.target.value); setEquipmentName(""); }} required>
+                <option value="">Select category</option>
+                {activeAudit.auditType === "Technical" && TECHNICAL_CATEGORIES.map((category) => <option key={category} value={category}>{category}</option>)}
+              </select></label>
+              <label>Equipment name <span>*</span><select value={equipmentName} onChange={(e) => setEquipmentName(e.target.value)} required disabled={!equipmentType}>
+                <option value="">{equipmentType ? "Select registered equipment" : "Select category first"}</option>
+                {(current.plants.find((plant) => plant.id === activeAudit.plantId)?.equipment ?? []).filter((item) => item.category === equipmentType).filter((item, index, items) => items.findIndex((candidate) => candidate.name.trim().toLocaleLowerCase() === item.name.trim().toLocaleLowerCase() && candidate.category.trim().toLocaleLowerCase() === item.category.trim().toLocaleLowerCase()) === index).filter((item) => !executionEquipment.some((added) => added.name.trim().toLocaleLowerCase() === item.name.trim().toLocaleLowerCase() && added.equipmentType.trim().toLocaleLowerCase() === item.category.trim().toLocaleLowerCase())).map((item) => <option key={`${item.category}:${item.name.trim().toLocaleLowerCase()}`} value={item.name}>{item.name}</option>)}
+              </select>
+              {equipmentType && !(current.plants.find((plant) => plant.id === activeAudit.plantId)?.equipment ?? []).some((item) => item.category === equipmentType) && <small className="field-hint">No {equipmentType} registered for this plant. Add its equipment inventory under Sites &amp; Plants first.</small>}
+              </label></div>
+              <div className="form-actions"><button className="primary-button" type="submit" disabled={!equipmentType || !equipmentName}>Save equipment</button></div>
+            </form>}
+            {executionEquipment.length === 0 ? <div className="empty-execution"><h4>No equipment added</h4><p>Add the equipment you want to inspect for this audit.</p></div> : <>
+            {activeAudit.auditType === "Technical" && <div className="equipment-filter"><label>View equipment checklist<select value={selectedEquipmentId} onChange={(e) => setSelectedEquipmentId(e.target.value)}><option value="">Select equipment to view checkpoints</option>{executionEquipment.filter((item) => item.equipmentType !== "Safety checklist" && item.equipmentType !== "Civil checklist").filter((item, index, items) => items.findIndex((candidate) => candidate.name.trim().toLocaleLowerCase() === item.name.trim().toLocaleLowerCase() && candidate.equipmentType.trim().toLocaleLowerCase() === item.equipmentType.trim().toLocaleLowerCase()) === index).map((item) => <option key={`${item.equipmentType}:${item.name.trim().toLocaleLowerCase()}`} value={item.id}>{item.name} Â· {item.equipmentType}</option>)}</select></label><small>Choose an equipment item to display its checkpoints.</small></div>}
+            {(!selectedEquipmentId && activeAudit.auditType === "Technical") ? <div className="empty-execution"><h4>No equipment selected</h4><p>Select an equipment item above to view or edit its checkpoints.</p></div> : executionEquipment.filter((item) => item.id === selectedEquipmentId && (activeAudit.auditType !== "Technical" || (item.equipmentType !== "Safety checklist" && item.equipmentType !== "Civil checklist"))).map((equipment) => <article className="equipment-card" key={equipment.id}>
+              <div className="equipment-card-heading"><div><h4>{equipment.name}</h4><small>{equipment.equipmentType || "Equipment"} Â· {equipment.checkpoints.length} checkpoint(s)</small></div></div>
+              <form className="checkpoint-add-form" onSubmit={(event) => void handleAddCheckpoint(event, equipment)}><label>Add checkpoint<input value={checkpointDrafts[equipment.id] ?? ""} onChange={(e) => setCheckpointDrafts((current) => ({ ...current, [equipment.id]: e.target.value }))} placeholder="e.g. Check earthing connection" required /></label><button type="submit" className="secondary-button">Add checkpoint</button></form>
+              {equipment.checkpoints.length > 0 && <div className="checkpoint-list">{equipment.checkpoints.map((checkpoint) => <div className="checkpoint-card" key={checkpoint.id}>
+                <div className="checkpoint-title"><b>{checkpoint.checkpointText}</b><span className={`result-pill result-${checkpoint.result.toLowerCase()}`}>{checkpoint.result}</span></div>
+                <div className="result-selector" role="group" aria-label={`Result for ${checkpoint.checkpointText}`}>{(["C","NC","NA","OFI"] as const).map((result) => <button type="button" key={result} className={checkpoint.result === result ? `result-option selected result-${result.toLowerCase()}` : "result-option"} onClick={() => void handleCheckpointChange(equipment.id, checkpoint, { result })}>{result === "C" ? "Compliant (C)" : result === "NC" ? "Non-Compliant (NC)" : result === "NA" ? "Not Applicable (NA)" : "Opportunity for Improvement (OFI)"}</button>)}</div>
+                <label className="remarks-label">Remarks<textarea value={checkpoint.remarks} onChange={(e) => void handleCheckpointChange(equipment.id, checkpoint, { remarks: e.target.value })} placeholder="Add inspection remarks..." rows={2} /></label><div className="checkpoint-photos"><div className="checkpoint-photo-heading"><b>Inspection photos</b><small>{(checkpoint.photos ?? []).length} saved</small></div><div className="photo-action-buttons"><button type="button" className="secondary-button photo-capture-button" disabled={activeAudit.status === "submitted"} onClick={() => void takeCheckpointPhoto(equipment.id, checkpoint)}>ðŸ“· Take Photo</button><label className="secondary-button photo-capture-button">ðŸ–¼ï¸ Choose from Gallery<input className="photo-file-input" type="file" accept="image/*" multiple disabled={activeAudit.status === "submitted"} onChange={(event) => { void handleCheckpointPhotos(equipment.id, checkpoint, event.currentTarget.files); event.currentTarget.value = ""; }} /></label></div>{(checkpoint.photos ?? []).length > 0 && <div className="checkpoint-photo-grid">{(checkpoint.photos ?? []).map((photo, photoIndex) => <div className="checkpoint-photo-item" key={`${checkpoint.id}-photo-${photoIndex}`}><img src={photo} alt={`Inspection photo ${photoIndex + 1}`} /><button type="button" disabled={activeAudit.status === "submitted"} aria-label={`Remove photo ${photoIndex + 1}`} onClick={() => void removeCheckpointPhoto(equipment.id, checkpoint, photoIndex)}>Remove</button></div>)}</div>}<small className="photo-storage-note">Photos are compressed and saved locally with this checkpoint for offline use.</small></div>
+              </div>)}</div>}
+              <div className="equipment-save-row"><button type="button" className="secondary-button" disabled={activeAudit.status === "submitted"} onClick={() => setMessage(`${equipment.name}: equipment and checkpoint changes are saved on this device.`)}>Save equipment</button></div>
+            </article>)}
+          </>}
+          <div className="submit-audit-panel"><div><b>Finish and lock this audit</b><small>Submit Audit finalizes the entire audit and prevents further edits.</small></div><div className="form-actions submit-audit-actions"><button type="button" className="primary-button" disabled={!activeAudit || activeAudit.status === "submitted"} onClick={() => void submitAudit()}>Submit Audit</button>{activeAudit?.status === "submitted" && <span className="observation-meta">Audit submitted and locked</span>}</div></div>
+          </section>}
+          {!activeAudit && !summaryAudit && (audits.length === 0 ? <div className="empty-state large-empty"><div className="empty-icon"><Icon name="audit" /></div><span className="card-kicker">AUDIT REGISTER</span><h3>No audits created yet</h3><p>Create your first Technical, Safety, or Civil audit. Nothing is preloaded.</p><button className="primary-button" onClick={() => setShowAuditForm(true)} disabled={current.plants.length === 0}><Icon name="plus" /> Create first audit</button></div> : <div className="audit-list">{audits.map((audit) => <article className="audit-row" key={audit.id}><div className="audit-type-mark"><Icon name="audit" /></div><div className="audit-copy"><b>{audit.title}</b><small>{audit.plantName || current.plants.find((p) => p.id === audit.plantId)?.name || "Plant"} Â· {audit.auditType} Â· {audit.auditDate}</small><small>Auditor: {audit.auditor}</small></div><span className="audit-status">{audit.status.replace("_", " ")}</span><button className="secondary-button open-audit-button" onClick={() => void openAudit(audit)}>Open audit</button></article>)}</div>)}
+        </div>}
+        {section === "Observations" && <div className="page-content">
+          <div className="section-heading"><div><h2>Observations</h2><p>NC and OFI findings across your saved audits.</p></div><span className="date-tag">{observations.filter(o=>o.status === "open").length} OPEN</span></div>
+          {observationDraft && <form className="content-card observation-form" onSubmit={(event) => void handleCreateObservation(event)}>
+            <div className="card-heading"><div><span className="card-kicker">{observationDraft.findingType === "NC" ? "NON-COMPLIANCE" : "OPPORTUNITY FOR IMPROVEMENT"}</span><h3>{observationDraft.observationId ? "Complete observation details" : `New ${observationDraft.findingType} observation`}</h3><p>{observationDraft.checkpointText}</p></div><button type="button" className="secondary-button" onClick={() => setObservationDraft(null)}>Cancel</button></div>
+            <div className="form-grid observation-grid"><label>Observation title <span>*</span><input value={observationTitle} onChange={e=>setObservationTitle(e.target.value)} required /></label><label>Severity <span>*</span><select value={observationSeverity} onChange={e=>setObservationSeverity(e.target.value)}><option>Minor</option><option>Major</option><option>Critical</option></select></label><label>Responsible person<input value={observationResponsible} onChange={e=>setObservationResponsible(e.target.value)} placeholder="Name or role" /></label><label>Target closure date<input type="date" value={observationTargetDate} onChange={e=>setObservationTargetDate(e.target.value)} /></label><label className="wide-field">Description<textarea value={observationDescription} onChange={e=>setObservationDescription(e.target.value)} rows={3} placeholder="Describe the finding..." /></label><label className="wide-field">{observationDraft.findingType === "NC" ? "Corrective action / Action taken" : "Improvement action / Action taken"}<textarea value={observationAction} onChange={e=>setObservationAction(e.target.value)} rows={3} placeholder="Describe action taken or planned..." /></label></div>
+            {(() => { const linked = observations.find(o => o.id === observationDraft.observationId); const checkpointPhotos = linked?.photos ?? []; return <div className="observation-photo-panel"><h4>Observation photos</h4><p>Inspection photos captured at this checkpoint appear here automatically.</p>{checkpointPhotos.length > 0 ? <div className="checkpoint-photo-grid">{checkpointPhotos.map((photo, index) => <div className="checkpoint-photo-item" key={`source-${index}`}><img src={photo} alt={`Checkpoint inspection ${index + 1}`} /><small>Inspection photo {index + 1}</small></div>)}</div> : <small>No checkpoint photos attached.</small>}<h4>Photos of action taken</h4><div className="photo-action-buttons"><button type="button" className="secondary-button photo-capture-button" onClick={() => void takeObservationActionPhoto()}>ðŸ“· Capture Action Photo</button><label className="secondary-button photo-capture-button">ðŸ–¼ï¸ Choose from Gallery<input className="photo-file-input" type="file" accept="image/*" multiple onChange={(event) => { const files = Array.from(event.currentTarget.files ?? []); files.forEach(file => void addObservationActionPhoto(file)); event.currentTarget.value = ""; }} /></label></div>{observationActionPhotos.length > 0 && <div className="checkpoint-photo-grid">{observationActionPhotos.map((photo, index) => <div className="checkpoint-photo-item" key={`action-${index}`}><img src={photo} alt={`Action taken photo ${index + 1}`} /><button type="button" onClick={() => setObservationActionPhotos(current => current.filter((_, i) => i !== index))}>Remove</button></div>)}</div>}</div>; })()}
+            <div className="form-actions"><button type="submit" className="primary-button">Save observation</button></div>
+          </form>}
+          {observations.length === 0 ? <div className="empty-state large-empty"><div className="empty-icon"><Icon name="eye" /></div><h3>No observations yet</h3><p>Submit an audit with NC or OFI checkpoints to create observations here. Complete the follow-up details after submission.</p><button className="secondary-button" onClick={()=>setSection("Audits")}>Go to audits <Icon name="arrow" /></button></div> : <div className="observation-list">{(() => { const plantGroups = new Map<string, LocalObservation[]>(); observations.forEach((o) => plantGroups.set(o.plantName || "Plant", [...(plantGroups.get(o.plantName || "Plant") ?? []), o])); return [...plantGroups.entries()].map(([plant, plantItems]) => { const auditGroups = new Map<string, LocalObservation[]>(); plantItems.forEach((o) => auditGroups.set(o.auditId, [...(auditGroups.get(o.auditId) ?? []), o])); return <details className="summary-observation-group observation-plant-group" key={plant} open><summary>{plant}<span>{plantItems.length} observation(s)</span></summary><div>{[...auditGroups.entries()].map(([auditId, auditItems]) => { return <details className="summary-observation-group" key={auditId}><summary>{auditItems[0]?.auditTitle || "Audit"}<span>{auditItems.length} observation(s)</span></summary><div>{auditItems.map((o) => <article className="content-card observation-row" key={o.id}><div className="observation-row-top"><span className={`finding-tag finding-${o.findingType.toLowerCase()}`}>{o.findingType}</span><span className={`observation-status status-${o.status}`}>{o.status}</span></div><h3>{o.title}</h3><p className="observation-meta">{o.checkpointText}</p>{o.description && <p>{o.description}</p>}<div className="observation-details"><span>Severity <b>{o.severity}</b></span><span>Responsible <b>{o.responsiblePerson || "Not assigned"}</b></span><span>Target date <b>{o.targetDate || "Not set"}</b></span></div>{o.actionText && <p><b>{o.findingType === "NC" ? "Corrective action / Action taken:" : "Improvement action / Action taken:"}</b> {o.actionText}</p>}{(o.photos?.length ?? 0) > 0 && <div className="observation-inline-photos"><b>Inspection photos</b><div className="checkpoint-photo-grid">{(o.photos ?? []).map((photo, index) => <div className="checkpoint-photo-item" key={`obs-${o.id}-${index}`}><img src={photo} alt={`Inspection photo ${index + 1}`} /></div>)}</div></div>}{(o.actionPhotos?.length ?? 0) > 0 && <div className="observation-inline-photos"><b>Action taken photos</b><div className="checkpoint-photo-grid">{(o.actionPhotos ?? []).map((photo, index) => <div className="checkpoint-photo-item" key={`obs-action-${o.id}-${index}`}><img src={photo} alt={`Action taken photo ${index + 1}`} /></div>)}</div></div>}<div className="form-actions"><button className="secondary-button" onClick={()=>editObservation(o)}>Complete details</button><button className="secondary-button" onClick={()=>void handleObservationStatus(o,o.status === "open" ? "closed" : "open")}>{o.status === "open" ? "Mark closed" : "Reopen"}</button></div></article>)}</div></details>; })}</div></details>; }); })()}</div>}
+        </div>}
+        {section === "Reports" && <div className="page-content"><div className="section-heading"><div><h2>Audit Reports</h2><p>Generate a PDF with checklist results, inspection photos, observations, and action-taken photos.</p></div><span className="date-tag">{audits.length} AUDIT(S)</span></div><div className="local-note report-note"><Icon name="report" /><span><b>Local report generation</b><br />Reports are generated on this device. Submitted audits are locked; draft reports are labelled with their current status.</span></div>{audits.length === 0 ? <div className="empty-state large-empty"><div className="empty-icon"><Icon name="report" /></div><h3>No audits available</h3><p>Create an audit and save checklist results before generating a report.</p><button className="secondary-button" onClick={() => setSection("Audits")}>View audits <Icon name="arrow" /></button></div> : <div className="report-list">{audits.map((audit) => <article className="content-card report-row" key={audit.id}><div className="audit-type-mark"><Icon name="report" /></div><div className="audit-copy"><b>{audit.title}</b><small>{audit.plantName || current.plants.find((p) => p.id === audit.plantId)?.name || "Plant"} Â· {audit.auditType} Â· {audit.auditDate}</small><small>Auditor: {audit.auditor || "Not specified"}</small></div><span className={`audit-status report-status-${audit.status}`}>{audit.status.replace("_", " ")}</span><button className="primary-button report-generate-button" onClick={() => void generateAuditReport(audit)}>Generate PDF</button></article>)}</div>}</div>}
+        {section === "Settings" && <div className="page-content"><section className="content-card settings-card"><div className="card-heading"><div><h3>Workspace settings</h3><p>Review the information saved on this device.</p></div><div className="metric-icon"><Icon name="settings" /></div></div><div className="settings-field"><span>Organization</span><b>{current.organizationName}</b></div><div className="settings-field"><span>Site name</span><b>{current.siteName}</b></div><div className="settings-field"><span>Site location</span><b>{current.siteLocation || "Not provided"}</b></div><div className="settings-field"><span>Plants registered</span><b>{plantsCount}</b></div><div className="local-note settings-note"><Icon name="cloud" /><span><b>Local prototype</b><br />Data is stored in this app's local browser storage. It is not yet backed up to the server or synced across devices.</span></div><div className="danger-zone"><div><b>Reset local workspace</b><small>Removes this workspace and its plant list from this device only.</small></div><button className="danger-button" onClick={resetWorkspace}>Reset workspace</button></div></section></div>}
+        <footer className="main-footer"><span>Solar Audit Mobile</span><span>Fresh workspace Â· Local prototype Â· Server sync not connected</span></footer>
+      </main>
+      <nav className="mobile-nav" aria-label="Mobile navigation">{navItems.slice(0, 5).map((item) => <button key={item.label} className={section === item.label ? "mobile-nav-item active" : "mobile-nav-item"} onClick={() => setSection(item.label)}><Icon name={item.icon} /><span>{item.label === "Sites & Plants" ? "Plants" : item.label}</span></button>)}</nav>
+    </div>
+  );
+}
+
+
