@@ -607,53 +607,77 @@ export default function App() {
 
       section("03  Equipment Audit Details", "Checkpoint results by equipment (Complied / Not Complied / N/A).");
       const statusLabel = (r: string) => r === "C" ? "Complied" : r === "NC" ? "Not Complied" : r === "NA" ? "N/A" : r === "OFI" ? "Opportunity for Improvement" : (r || "Not answered");
-      for (let ei = 0; ei < execution.length; ei++) {
-        const equipment = execution[ei];
-        const c = equipment.checkpoints.filter((p) => p.result === "C").length;
-        const nc = equipment.checkpoints.filter((p) => p.result === "NC").length;
-        const pct = c + nc ? c / (c + nc) * 100 : 0;
-        headerBand(`${String(ei + 1).padStart(2, "0")}  ${equipment.name} | ${equipment.equipmentType}`, `${pct.toFixed(0)}%`);
-        const widths = [9, CW - 9 - 34 - 46, 34, 46];
-        if (!equipment.checkpoints.length) {
-          text("No checkpoints saved.", M + 2, y + 3, CW - 4, 8);
-          y += 7;
-        } else {
-          drawTable(
-            ["#", "Inspection Point", "Result", "Remarks"],
-            widths,
-            equipment.checkpoints.map((cp, ci) => {
-              const resultColor: [number, number, number] = cp.result === "C" ? [83, 132, 65] : cp.result === "NC" ? [201, 77, 77] : [110, 118, 126];
-              return {
-                cells: [String(ci + 1), cp.checkpointText || "Checkpoint", statusLabel(cp.result), cp.remarks || "—"],
-                boldCols: [2],
-                colorCols: { 2: resultColor },
-              };
-            }),
-            7,
-          );
+      const renderExecutionItems = async (items: AuditEquipment[]) => {
+        for (let ei = 0; ei < items.length; ei++) {
+          const equipment = items[ei];
+          const c = equipment.checkpoints.filter((p) => p.result === "C").length;
+          const nc = equipment.checkpoints.filter((p) => p.result === "NC").length;
+          const pct = c + nc ? (c / (c + nc)) * 100 : 0;
+          headerBand(`${String(ei + 1).padStart(2, "0")}  ${equipment.name} | ${equipment.equipmentType}`, `${pct.toFixed(0)}%`);
+          const widths = [9, CW - 9 - 34 - 46, 34, 46];
+          if (!equipment.checkpoints.length) {
+            text("No checkpoints saved.", M + 2, y + 3, CW - 4, 8);
+            y += 7;
+          } else {
+            drawTable(
+              ["#", "Inspection Point", "Result", "Remarks"],
+              widths,
+              equipment.checkpoints.map((cp, ci) => {
+                const resultColor: [number, number, number] = cp.result === "C" ? [83, 132, 65] : cp.result === "NC" ? [201, 77, 77] : [110, 118, 126];
+                return {
+                  cells: [String(ci + 1), cp.checkpointText || "Checkpoint", statusLabel(cp.result), cp.remarks || "—"],
+                  boldCols: [2],
+                  colorCols: { 2: resultColor },
+                };
+              }),
+              7,
+            );
+          }
+          const photos: PdfPhotoEntry[] = equipment.checkpoints.flatMap((cp) => (cp.photos ?? []).map((p) => ({
+            src: p.src,
+            kind: "Inspection Evidence",
+            caption: cp.checkpointText || "Inspection point",
+            remark: p.remark,
+            latitude: p.latitude,
+            longitude: p.longitude,
+          })));
+          if (photos.length) {
+            ensure(10); y += 3; text("Photo Evidence", M, y + 2, CW, 9, true, NAVY); y += 5;
+            await renderPhotoGrid(photos);
+            y += 2;
+          }
+          y += 4;
         }
-        const photos: PdfPhotoEntry[] = equipment.checkpoints.flatMap((cp) => (cp.photos ?? []).map((p) => ({
-          src: p.src,
-          kind: "Inspection Evidence",
-          caption: cp.checkpointText || "Inspection point",
-          remark: p.remark,
-          latitude: p.latitude,
-          longitude: p.longitude,
-        })));
-        if (photos.length) {
-          ensure(10); y += 3; text("Photo Evidence", M, y + 2, CW, 9, true, NAVY); y += 5;
-          await renderPhotoGrid(photos);
-          y += 2;
-        }
-        y += 4;
+      };
+
+      const isSafetyItem = (e: AuditEquipment) => /safety/i.test(`${e.name} ${e.equipmentType}`);
+      const isCivilItem = (e: AuditEquipment) => /civil|infrastructure/i.test(`${e.name} ${e.equipmentType}`);
+      const technicalExecution = execution.filter((e) => !isSafetyItem(e) && !isCivilItem(e));
+      const safety = execution.filter(isSafetyItem);
+      const civil = execution.filter(isCivilItem);
+
+      if (!technicalExecution.length) {
+        text("No technical equipment checkpoints were recorded for this audit.", M, y + 2, CW, 8);
+        y += 7;
+      } else {
+        await renderExecutionItems(technicalExecution);
       }
 
       section("04  Safety Audit", "Site-level safety checkpoints.");
-      const safety = execution.filter((e) => /safety/i.test(`${e.name} ${e.equipmentType}`));
-      if (!safety.length) { text("No safety checkpoints were answered for this audit.", M, y, CW, 8); y += 6; }
+      if (!safety.length) {
+        text("No safety checkpoints were answered for this audit.", M, y + 2, CW, 8);
+        y += 7;
+      } else {
+        await renderExecutionItems(safety);
+      }
+
       section("05  Civil / Infrastructure Audit", "Site-level civil and infrastructure checkpoints.");
-      const civil = execution.filter((e) => /civil|infrastructure/i.test(`${e.name} ${e.equipmentType}`));
-      if (!civil.length) { text("No Civil / Infrastructure checkpoints were answered for this audit.", M, y, CW, 8); y += 6; }
+      if (!civil.length) {
+        text("No Civil / Infrastructure checkpoints were answered for this audit.", M, y + 2, CW, 8);
+        y += 7;
+      } else {
+        await renderExecutionItems(civil);
+      }
 
       section("06  Observations & Closure Tracking", "Findings, severity, responsible person, target date and current closure status.");
       const obsWidths = [8, 38, 46, 22, 24, 22, CW - 160];
