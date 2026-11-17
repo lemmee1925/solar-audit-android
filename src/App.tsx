@@ -186,6 +186,9 @@ export default function App() {
   const [observationPlantFilter, setObservationPlantFilter] = useState("all");
   const [reportSearch, setReportSearch] = useState("");
   const [reportStatusFilter, setReportStatusFilter] = useState("all");
+  const [specPlant, setSpecPlant] = useState<Plant | null>(null);
+  const [specValues, setSpecValues] = useState<Record<string, string>>({});
+  const [specSaving, setSpecSaving] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -707,33 +710,63 @@ export default function App() {
     setExistingEquipmentCategory(""); setExistingEquipmentQuantity("1");
   }
 
+  const PLANT_SPEC_FIELDS: Array<[string, string, boolean]> = [
+    ["building_name", "Building / plant name", false], ["roof_type", "Roof type", false], ["city", "City", false], ["state", "State", false],
+    ["no_of_blocks", "Number of blocks", true], ["dc_capacity", "DC capacity (MWp)", true], ["ac_capacity", "AC capacity (MW)", true],
+    ["central_inverter_type", "Central inverter type", false], ["central_inverter_count", "Central inverter count", true],
+    ["string_inverter_type", "String inverter type", false], ["string_inverter_count", "String inverter count", true],
+    ["scb_count", "SCB count", true], ["mms_type", "MMS type", false], ["mms_count", "MMS count", true],
+    ["transformer_type", "Transformer type", false], ["transformer_count", "Transformer count", true],
+    ["lt_panel_type", "LT panel type", false], ["lt_panel_count", "LT panel count", true], ["ht_panel_type", "HT panel type", false], ["ht_panel_count", "HT panel count", true],
+    ["acdb_count", "ACDB count", true], ["ups_db_battery_count", "UPS/DB battery count", true], ["lightning_protection_count", "Lightning protection count", true],
+    ["clamps_connectors_count", "Clamps/connectors count", true], ["dc_earthing", "DC earthing", false], ["ac_earthing", "AC earthing", false],
+  ];
+
   async function editPlantSpecifications(plant: Plant) {
     if (!plant.serverPlantId || !serverToken) { setMessage("Plant specifications can be edited from the APK only for a backend-managed plant while signed in as an administrator."); return; }
     try {
-      const specs = await getServerPlantSpecs(serverBaseUrl, serverToken, plant.serverPlantId);
-      const fields: Array<[keyof typeof specs, string, boolean]> = [
-        ["building_name", "Building / plant name", false], ["roof_type", "Roof type", false], ["city", "City", false], ["state", "State", false],
-        ["no_of_blocks", "Number of blocks", true], ["dc_capacity", "DC capacity", true], ["ac_capacity", "AC capacity", true],
-        ["central_inverter_type", "Central inverter type", false], ["central_inverter_count", "Central inverter count", true],
-        ["string_inverter_type", "String inverter type", false], ["string_inverter_count", "String inverter count", true],
-        ["scb_count", "SCB count", true], ["mms_type", "MMS type", false], ["mms_count", "MMS count", true],
-        ["transformer_type", "Transformer type", false], ["transformer_count", "Transformer count", true],
-        ["lt_panel_type", "LT panel type", false], ["lt_panel_count", "LT panel count", true], ["ht_panel_type", "HT panel type", false], ["ht_panel_count", "HT panel count", true],
-        ["acdb_count", "ACDB count", true], ["ups_db_battery_count", "UPS/DB battery count", true], ["lightning_protection_count", "Lightning protection count", true],
-        ["clamps_connectors_count", "Clamps/connectors count", true], ["dc_earthing", "DC earthing", false], ["ac_earthing", "AC earthing", false],
-      ];
-      const updates: Record<string, string | number | null> = {};
-      for (const [key, label, numeric] of fields) {
-        const raw = window.prompt(`${label} (leave blank to clear)`, specs[key] == null ? "" : String(specs[key]));
-        if (raw === null) { setMessage("Plant specification edit cancelled; no changes were saved."); return; }
-        if (numeric) { if (!raw.trim()) updates[key] = null; else { const n = Number(raw); if (!Number.isFinite(n) || n < 0) throw new Error(`${label} must be a non-negative number.`); updates[key] = n; } }
-        else updates[key] = raw.trim() || null;
+      const specs = await getServerPlantSpecs(serverBaseUrl, serverToken, plant.serverPlantId) as Record<string, unknown>;
+      const initial: Record<string, string> = {};
+      for (const [key] of PLANT_SPEC_FIELDS) {
+        initial[key] = specs[key] == null ? "" : String(specs[key]);
       }
-      await saveServerPlantSpecs(serverBaseUrl, serverToken, plant.serverPlantId, updates);
+      setSpecPlant(plant);
+      setSpecValues(initial);
+      setMessage("");
+    } catch (error) { setMessage(error instanceof Error ? `Could not load plant specifications: ${error.message}` : "Could not load plant specifications."); }
+  }
+
+  async function savePlantSpecificationsForm(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!specPlant?.serverPlantId || !serverToken || specSaving) return;
+    setSpecSaving(true);
+    try {
+      const updates: Record<string, string | number | null> = {};
+      for (const [key, label, numeric] of PLANT_SPEC_FIELDS) {
+        const raw = (specValues[key] ?? "").trim();
+        if (numeric) {
+          if (!raw) updates[key] = null;
+          else {
+            const n = Number(raw);
+            if (!Number.isFinite(n) || n < 0) throw new Error(`${label} must be a non-negative number.`);
+            updates[key] = n;
+          }
+        } else {
+          updates[key] = raw || null;
+        }
+      }
+      await saveServerPlantSpecs(serverBaseUrl, serverToken, specPlant.serverPlantId, updates);
       const siteId = serverBootstrap?.sites?.[0]?.id;
       if (siteId) { const refreshed = await downloadSiteReferenceData(serverBaseUrl, serverToken, siteId); await cacheServerReferenceData(refreshed); }
-      setMessage(`Specifications for “${plant.name}” saved to the backend.`);
-    } catch (error) { setMessage(error instanceof Error ? `Plant specification save failed: ${error.message}` : "Plant specification save failed."); }
+      const savedName = specPlant.name;
+      setSpecPlant(null);
+      setSpecValues({});
+      setMessage(`Specifications for “${savedName}” saved to the backend.`);
+    } catch (error) {
+      setMessage(error instanceof Error ? `Plant specification save failed: ${error.message}` : "Plant specification save failed.");
+    } finally {
+      setSpecSaving(false);
+    }
   }
 
   function deletePlant(id: string) {
@@ -1689,6 +1722,15 @@ export default function App() {
             </div>
             <div className="form-actions"><button type="button" className="secondary-button" onClick={() => setShowPlantForm(false)}>Cancel</button><button className="primary-button" type="submit">Save plant</button></div></form>}
           <div className="section-heading compact-heading"><div><h2>Plant register</h2><p>{plantsCount} plant{plantsCount === 1 ? "" : "s"} added</p></div></div>
+          {specPlant && <form className="content-card plant-form" onSubmit={(event) => void savePlantSpecificationsForm(event)}>
+            <div className="card-heading"><div><h3>Plant specifications · {specPlant.name}</h3><p>Update technical specifications saved on the backend (leave blank to clear).</p></div><button type="button" className="close-button" onClick={() => setSpecPlant(null)} aria-label="Close">×</button></div>
+            <div className="form-grid">
+              {PLANT_SPEC_FIELDS.map(([key, label, numeric]) => (
+                <label key={key}>{label}<input type={numeric ? "number" : "text"} min={numeric ? "0" : undefined} step={numeric ? "any" : undefined} value={specValues[key] ?? ""} onChange={(e) => setSpecValues((prev) => ({ ...prev, [key]: e.target.value }))} placeholder={numeric ? "0" : "Enter value"} /></label>
+              ))}
+            </div>
+            <div className="form-actions"><button type="button" className="secondary-button" onClick={() => setSpecPlant(null)}>Cancel</button><button className="primary-button" type="submit" disabled={specSaving}>{specSaving ? "Saving…" : "Save specifications"}</button></div>
+          </form>}
           {plantsCount === 0 ? <div className="empty-state"><div className="empty-icon"><Icon name="plant" /></div><h3>No plants added yet</h3><p>No plants are available in the current workspace. Connect to the backend and refresh reference data, or add an offline draft.</p><button className="primary-button" onClick={() => setShowPlantForm(true)}><Icon name="plus" /> Add first plant</button></div> : <div className="plant-list">{current.plants.map((plant) => <div className="plant-record" key={plant.id}><article className="plant-row"><div className="plant-symbol"><Icon name="plant" /></div><div className="plant-details"><b>{plant.name}</b><small>{plant.location || "Location not provided"}</small><small>{(plant.equipment ?? []).length} registered equipment item(s)</small></div><div className="plant-capacity"><small>CAPACITY</small><b>{plant.capacityMw ? `${plant.capacityMw} MW` : "—"}</b></div>{plant.source === "server" || plant.serverPlantId ? <><span className="site-status">Backend managed</span><button type="button" className="secondary-button" onClick={() => void editPlantSpecifications(plant)}>Plant specifications</button><button type="button" className="secondary-button" onClick={() => setConfigurePlantId((currentId) => currentId === plant.id ? "" : plant.id)}>{configurePlantId === plant.id ? "Done" : "Configure equipment"}</button></> : <><button type="button" className="secondary-button" onClick={() => void editPlantSpecifications(plant)}>Plant specifications</button><button type="button" className="secondary-button" onClick={() => setConfigurePlantId((currentId) => currentId === plant.id ? "" : plant.id)}>{configurePlantId === plant.id ? "Done" : "Configure equipment"}</button><button className="delete-button" onClick={() => deletePlant(plant.id)} aria-label={`Delete ${plant.name}`} title="Delete plant">×</button></>}</article>
             {configurePlantId === plant.id && <div className="plant-inventory-editor"><h4>Equipment inventory · {plant.name}</h4><div className="inventory-category-groups">{Object.entries((plant.equipment ?? []).reduce<Record<string, PlantEquipment[]>>((groups, item) => { const category = item.category || "Other / Custom"; (groups[category] ??= []).push(item); return groups; }, {})).length > 0 ? Object.entries((plant.equipment ?? []).reduce<Record<string, PlantEquipment[]>>((groups, item) => { const category = item.category || "Other / Custom"; (groups[category] ??= []).push(item); return groups; }, {})).map(([category, items]) => <details className="inventory-category-group" key={category}><summary className="inventory-category-summary-row"><span className="inventory-category-check" aria-label="Registered">✓</span><span className="inventory-category-name">{category}</span><b className="inventory-category-count">{items.length}</b><span className="inventory-category-chevron" aria-hidden="true">⌄</span></summary><div className="inventory-category-items">{items.map((item) => <div className="inventory-item-admin-row" key={item.id}><span>{item.name}</span><button type="button" className="text-button" onClick={() => renamePlantEquipment(plant.id, item.id, item.name)}>Rename</button><button type="button" className="delete-button" onClick={() => removePlantEquipment(plant.id, item.id, item.name)} aria-label={`Remove ${item.name}`}>×</button></div>)}</div></details>) : <p>No equipment registered yet.</p>}</div><div className="form-grid"><label>Category<select value={existingEquipmentCategory} onChange={(e) => setExistingEquipmentCategory(e.target.value)}><option value="">Select category</option>{equipmentCategories.map((category) => <option key={category} value={category}>{category}</option>)}</select></label><label>Quantity to add<input type="number" min="1" max="500" value={existingEquipmentQuantity} onChange={(e) => setExistingEquipmentQuantity(e.target.value)} /></label></div><button type="button" className="primary-button" onClick={() => addEquipmentToExistingPlant(plant.id)}>Add registered equipment</button></div>}
           </div>)}</div>}
