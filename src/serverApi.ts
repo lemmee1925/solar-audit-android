@@ -209,7 +209,7 @@ export type AuditManifestPayload = {
   state: string;
   asset_id_ref: string;
   assets: Array<{ asset_ref: string; asset_type_id: number; asset_name: string; location: string; rank: string; observation: string; remarks: string; is_audited: boolean }>;
-  responses: Array<{ asset_ref: string; question_id: number; response_status: "pass" | "fail" | "na" | "ofi"; remarks: string; observation: string }>;
+  responses: Array<{ asset_ref: string; question_id: number; response_status: "pass" | "fail" | "na" | "ofi"; ofi_category?: string; remarks: string; observation: string }>;
 };
 
 export async function syncAuditManifest(
@@ -335,6 +335,7 @@ export type ServerObservation = {
   checkpoint_text: string;
   response_status?: string | null;
   finding_type?: "NC" | "OFI" | string;
+  ofi_category?: string;
   observation: string;
   severity: string;
   responsible_person: string;

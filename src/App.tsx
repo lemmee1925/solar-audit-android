@@ -4,7 +4,7 @@ import { Filesystem, Directory } from "@capacitor/filesystem";
 import { Share } from "@capacitor/share";
 import "./styles.css";
 import { TECHNICAL_CHECKLISTS, TECHNICAL_CATEGORIES, SAFETY_CHECKLIST, CIVIL_CHECKLIST } from "./checklistLibrary";
-import { addAuditCheckpoint, addAuditEquipment, clearWorkspace, createAudit, initializeLocalDatabase, loadAuditExecution, loadAuditExecutionPhotoRefs, resolvePhotoRef, loadAudits, loadWorkspace, saveWorkspace, updateAuditCheckpoint, type AuditCheckpoint, type AuditEquipment, type AuditType, type AssignedUserScope, type LocalAudit, type LocalObservation, type FindingType, type PhotoItem, loadObservations, createObservation, deleteObservation, markAuditSubmitted, updateAuditType, updateObservationDetails, saveObservationActionPhotos, linkObservationToServer, markObservationSyncError, cacheServerReferenceData, loadCachedServerReferenceData, mergeServerPlantsIntoWorkspace, saveAuditSyncAcknowledgement, reconcileServerAuditStatuses } from "./db";
+import { addAuditCheckpoint, addAuditEquipment, clearWorkspace, createAudit, initializeLocalDatabase, loadAuditExecution, loadAuditExecutionPhotoRefs, resolvePhotoRef, loadAudits, loadWorkspace, saveWorkspace, updateAuditCheckpoint, type AuditCheckpoint, type AuditEquipment, type AuditType, type AssignedUserScope, type LocalAudit, type LocalObservation, type FindingType, type OfiCategory, type PhotoItem, loadObservations, createObservation, deleteObservation, markAuditSubmitted, updateAuditType, updateObservationDetails, saveObservationActionPhotos, linkObservationToServer, markObservationSyncError, cacheServerReferenceData, loadCachedServerReferenceData, mergeServerPlantsIntoWorkspace, saveAuditSyncAcknowledgement, reconcileServerAuditStatuses } from "./db";
 import { authenticateAndBootstrap, downloadSiteReferenceData, createServerPlant, createServerAsset, renameServerAsset, deleteServerAsset, getServerPlantSpecs, saveServerPlantSpecs, syncAuditManifest, syncAuditPhoto, completeServerAudit, fetchServerAuditStatuses, fetchServerObservations, saveServerObservationDetails, updateServerObservationAction, uploadServerObservationPhoto, type MobileBootstrap, type AuditManifestPayload } from "./serverApi";
 
 type PlantEquipment = {
@@ -220,6 +220,7 @@ export default function App() {
   const [observationTitle, setObservationTitle] = useState("");
   const [observationDescription, setObservationDescription] = useState("");
   const [observationSeverity, setObservationSeverity] = useState("");
+  const [observationOfiCategory, setObservationOfiCategory] = useState<OfiCategory | "">("");
   const [observationResponsible, setObservationResponsible] = useState("");
   const [observationAction, setObservationAction] = useState("");
   const [observationTargetDate, setObservationTargetDate] = useState("");
@@ -664,23 +665,20 @@ export default function App() {
         await renderExecutionItems(technicalExecution);
       }
 
-      section("04  Safety Audit", "Site-level safety checkpoints.");
-      if (!safety.length) {
-        text("No safety checkpoints were answered for this audit.", M, y + 2, CW, 8);
-        y += 7;
-      } else {
+      let nextPdfSection = 4;
+      const secNum = () => String(nextPdfSection++).padStart(2, "0");
+
+      if (safety.some((e) => e.checkpoints.length > 0)) {
+        section(`${secNum()}  Safety Audit`, "Site-level safety checkpoints.");
         await renderExecutionItems(safety);
       }
 
-      section("05  Civil / Infrastructure Audit", "Site-level civil and infrastructure checkpoints.");
-      if (!civil.length) {
-        text("No Civil / Infrastructure checkpoints were answered for this audit.", M, y + 2, CW, 8);
-        y += 7;
-      } else {
+      if (civil.some((e) => e.checkpoints.length > 0)) {
+        section(`${secNum()}  Civil / Infrastructure Audit`, "Site-level civil and infrastructure checkpoints.");
         await renderExecutionItems(civil);
       }
 
-      section("06  Observations & Closure Tracking", "Findings, severity, responsible person, target date and current closure status.");
+      section(`${secNum()}  Observations & Closure Tracking`, "Findings, severity, responsible person, target date and current closure status.");
       const obsWidths = [8, 38, 46, 22, 24, 22, CW - 160];
       if (!auditObservations.length) {
         text("No observations recorded for this audit.", M, y + 3, CW, 8);
@@ -1238,7 +1236,13 @@ export default function App() {
 
   async function handleCheckpointChange(equipmentId: string, checkpoint: AuditCheckpoint, changes: Partial<AuditCheckpoint>) {
     if (!activeAudit) return;
-    const updated = { ...checkpoint, ...changes };
+    const updated: AuditCheckpoint = {
+      ...checkpoint,
+      ...changes,
+      ofiCategory: (changes.result ?? checkpoint.result) === "OFI"
+        ? (changes.ofiCategory !== undefined ? changes.ofiCategory : (checkpoint.ofiCategory ?? ""))
+        : "",
+    };
     setExecutionEquipment((current) => current.map((eq) => eq.id === equipmentId
       ? { ...eq, checkpoints: eq.checkpoints.map((cp) => cp.id === checkpoint.id ? updated : cp) }
       : eq));
@@ -1362,6 +1366,7 @@ export default function App() {
             auditId: activeAudit.id,
             checkpointId: checkpoint.id,
             findingType: checkpoint.result as FindingType,
+            ofiCategory: checkpoint.result === "OFI" ? (checkpoint.ofiCategory ?? "") : "",
             title: checkpoint.checkpointText,
             description: checkpoint.remarks || "",
             severity: "",
@@ -1604,16 +1609,16 @@ export default function App() {
     try {
       let savedId = observationDraft.observationId;
       if (savedId) {
-        await updateObservationDetails({ id: savedId, title: observationTitle, description: observationDescription, severity: observationSeverity, responsiblePerson: observationResponsible, actionText: observationAction, targetDate: observationTargetDate, closureDate: observationClosureDate });
+        await updateObservationDetails({ id: savedId, title: observationTitle, description: observationDescription, severity: observationSeverity, ofiCategory: observationDraft.findingType === "OFI" ? observationOfiCategory : "", responsiblePerson: observationResponsible, actionText: observationAction, targetDate: observationTargetDate, closureDate: observationClosureDate });
         await saveObservationActionPhotos(savedId, observationActionPhotos);
       } else {
-        savedId = await createObservation({ ...observationDraft, title: observationTitle, description: observationDescription, severity: observationSeverity, responsiblePerson: observationResponsible, actionText: observationAction, targetDate: observationTargetDate });
-        await updateObservationDetails({ id: savedId, title: observationTitle, description: observationDescription, severity: observationSeverity, responsiblePerson: observationResponsible, actionText: observationAction, targetDate: observationTargetDate, closureDate: observationClosureDate });
+        savedId = await createObservation({ ...observationDraft, ofiCategory: observationDraft.findingType === "OFI" ? observationOfiCategory : "", title: observationTitle, description: observationDescription, severity: observationSeverity, responsiblePerson: observationResponsible, actionText: observationAction, targetDate: observationTargetDate });
+        await updateObservationDetails({ id: savedId, title: observationTitle, description: observationDescription, severity: observationSeverity, ofiCategory: observationDraft.findingType === "OFI" ? observationOfiCategory : "", responsiblePerson: observationResponsible, actionText: observationAction, targetDate: observationTargetDate, closureDate: observationClosureDate });
         await saveObservationActionPhotos(savedId, observationActionPhotos);
       }
       setObservations(await loadObservations());
       const savedLocal = (await loadObservations()).find(item => item.id === savedId);
-      setObservationDraft(null); setObservationTitle(""); setObservationDescription(""); setObservationSeverity(""); setObservationResponsible(""); setObservationAction(""); setObservationTargetDate(""); setObservationClosureDate(""); setObservationActionPhotos([]);
+      setObservationDraft(null); setObservationTitle(""); setObservationDescription(""); setObservationSeverity(""); setObservationOfiCategory(""); setObservationResponsible(""); setObservationAction(""); setObservationTargetDate(""); setObservationClosureDate(""); setObservationActionPhotos([]);
       if (serverToken && savedLocal && (savedLocal.findingType === "NC" || savedLocal.findingType === "OFI")) {
         await refreshServerObservations(savedLocal.auditId, { forcePushObservationIds: [savedLocal.id] });
       } else {
@@ -1627,6 +1632,7 @@ export default function App() {
     setObservationTitle(o.title);
     setObservationDescription(o.description);
     setObservationSeverity(o.severity || "");
+    setObservationOfiCategory(o.ofiCategory || "");
     setObservationResponsible(o.responsiblePerson);
     setObservationAction(o.actionText);
     setObservationTargetDate(o.targetDate);
@@ -1852,7 +1858,7 @@ export default function App() {
         const obsText = (cp.result === "NC" || cp.result === "OFI")
           ? (localObs?.description?.trim() || cp.remarks?.trim() || "")
           : "";
-        responses.push({ asset_ref: assetRef, question_id: Number(questionMatches[0].id), response_status: result, remarks: cp.remarks || "", observation: obsText });
+        responses.push({ asset_ref: assetRef, question_id: Number(questionMatches[0].id), response_status: result, ofi_category: cp.result === "OFI" ? (cp.ofiCategory || localObs?.ofiCategory || "") : "", remarks: cp.remarks || "", observation: obsText });
         (cp.photos ?? []).forEach((photo, photoIndex) => photoQueue.push({ checkpointId: cp.id, photoIndex, photo, questionId: Number(questionMatches[0].id), assetRef }));
       }
     }
@@ -2070,7 +2076,7 @@ export default function App() {
   if (!hasWorkspace) {
     return (
       <main className="setup-page">
-        <div className="setup-brand"><div className="brand-mark"><Icon name="sun" /></div><div><span className="eyebrow">FIELD OPERATIONS</span><h1>Solar Audit<span> Mobile</span></h1></div></div>
+        <div className="setup-brand"><div className="brand-mark"><Icon name="sun" /></div><div><span className="eyebrow">FIELD OPERATIONS</span><h1>CMES<span> AssetCare</span></h1></div></div>
         <div className="setup-layout">
           <section className="setup-intro">
             <span className="pill"><span className="status-dot" /> PLANT ACCESS LOGIN</span>
@@ -2088,7 +2094,7 @@ export default function App() {
             <div className="local-note"><Icon name="cloud" /><span><b>Plant-scoped security</b><br />Your password is never stored on this device. Only plants assigned to your account are shown.</span></div>
           </form>
         </div>
-        <footer className="setup-footer">SOLAR AUDIT MOBILE <span>•</span> PLANT-SCOPED ACCESS</footer>
+        <footer className="setup-footer">CMES ASSETCARE <span>•</span> PLANT-SCOPED ACCESS</footer>
       </main>
     );
   }
@@ -2112,13 +2118,13 @@ export default function App() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div className="sidebar-brand"><div className="brand-mark"><Icon name="sun" /></div><div><strong>Solar Audit</strong><small>Mobile workspace</small></div></div>
+        <div className="sidebar-brand"><div className="brand-mark"><Icon name="sun" /></div><div><strong>CMES AssetCare</strong><small>Mobile workspace</small></div></div>
         <div className="workspace-label">WORKSPACE</div>
         <div className="workspace-mini"><div className="workspace-avatar">{(assignedUser?.fullName || assignedUser?.username || current.organizationName).slice(0, 1).toUpperCase()}</div><div className="workspace-copy"><b>{assignedUser?.fullName || assignedUser?.username || current.organizationName}</b><small>{visiblePlants.length === 1 ? visiblePlants[0].name : current.siteName}</small></div></div>
         <nav className="side-nav" aria-label="Main navigation">
           {navItems.map((item) => <button key={item.label} className={section === item.label ? "nav-item active" : "nav-item"} onClick={() => { setSection(item.label); setMessage(""); }}><Icon name={item.icon} /><span>{item.label}</span>{item.label === "Audits" && <em>{visibleAudits.length}</em>}</button>)}
         </nav>
-        <div className="sidebar-bottom"><div className="sync-mini"><span className="status-dot green" /><div><b>On-device workspace</b><small>Offline-ready data storage</small></div></div><small className="version-label">Solar Audit Mobile</small></div>
+        <div className="sidebar-bottom"><div className="sync-mini"><span className="status-dot green" /><div><b>On-device workspace</b><small>Offline-ready data storage</small></div></div><small className="version-label">CMES AssetCare</small></div>
       </aside>
 
       <main className="main-panel">
@@ -2214,6 +2220,22 @@ export default function App() {
                 {equipment.checkpoints.length > 0 && <div className="checkpoint-list">{equipment.checkpoints.map((checkpoint) => <div className="checkpoint-card" key={checkpoint.id}>
                   <div className="checkpoint-title"><b>{checkpoint.checkpointText}</b><span className={`result-pill result-${checkpoint.result.toLowerCase()}`}>{checkpoint.result}</span></div>
                   <div className="result-selector" role="group" aria-label={`Result for ${checkpoint.checkpointText}`}>{(["C", "NC", "NA", "OFI"] as const).map((result) => <button type="button" key={result} className={checkpoint.result === result ? `result-option selected result-${result.toLowerCase()}` : "result-option"} onClick={() => void handleCheckpointChange(equipment.id, checkpoint, { result })}>{result === "C" ? "Compliant (C)" : result === "NC" ? "Non-Compliant (NC)" : result === "NA" ? "Not Applicable (NA)" : "Opportunity for Improvement (OFI)"}</button>)}</div>
+                  {checkpoint.result === "OFI" && (
+                    <label className="ofi-category-label">
+                      OFI Category <span>*</span>
+                      <select
+                        value={checkpoint.ofiCategory ?? ""}
+                        disabled={activeAudit.status === "submitted"}
+                        onChange={(e) => void handleCheckpointChange(equipment.id, checkpoint, { ofiCategory: e.target.value as OfiCategory | "" })}
+                      >
+                        <option value="">Select OFI category...</option>
+                        <option value="Safety">Safety</option>
+                        <option value="Profitability">Profitability</option>
+                        <option value="Reliability">Reliability</option>
+                        <option value="Aesthetic">Aesthetic</option>
+                      </select>
+                    </label>
+                  )}
                   <label className="remarks-label">Remarks<textarea value={checkpoint.remarks} onChange={(e) => void handleCheckpointChange(equipment.id, checkpoint, { remarks: e.target.value })} placeholder="Add inspection remarks..." rows={2} /></label><div className="checkpoint-photos"><div className="checkpoint-photo-heading"><b>Inspection photos</b><small>{(checkpoint.photos ?? []).length} saved</small></div><div className="photo-action-buttons"><button type="button" className="secondary-button photo-capture-button" disabled={activeAudit.status === "submitted"} onClick={() => void takeCheckpointPhoto(equipment.id, checkpoint)}>📷 Take Photo</button><label className="secondary-button photo-capture-button">🖼️ Choose from Gallery<input className="photo-file-input" type="file" accept="image/*" multiple disabled={activeAudit.status === "submitted"} onChange={(event) => { void handleCheckpointPhotos(equipment.id, checkpoint, event.currentTarget.files); event.currentTarget.value = ""; }} /></label></div>{(checkpoint.photos ?? []).length > 0 && <div className="checkpoint-photo-grid">{(checkpoint.photos ?? []).map((photo, photoIndex) => <div className="checkpoint-photo-item" key={`${checkpoint.id}-photo-${photoIndex}`}><div className="photo-thumb-wrap"><img className="photo-thumb-img" src={photo.src} alt={`Inspection photo ${photoIndex + 1}`} onClick={() => setPreviewPhoto({ photo, label: `Inspection photo ${photoIndex + 1}` })} />{renderPhotoLocationBadge(photo)}</div><input type="text" className="photo-remark-input" placeholder="Add photo remark..." value={photo.remark ?? ""} disabled={activeAudit.status === "submitted"} onChange={(e) => void updateCheckpointPhotoRemark(equipment.id, checkpoint, photoIndex, e.target.value)} /><button type="button" disabled={activeAudit.status === "submitted"} aria-label={`Remove photo ${photoIndex + 1}`} onClick={() => void removeCheckpointPhoto(equipment.id, checkpoint, photoIndex)}>Remove</button></div>)}</div>}<small className="photo-storage-note">Photos are compressed and saved locally with this checkpoint for offline use.</small></div>
                 </div>)}</div>}
                 <div className="equipment-save-row"><button type="button" className="secondary-button" disabled={activeAudit.status === "submitted"} onClick={() => setMessage(`${equipment.name}: equipment and checkpoint changes are saved on this device.`)}>Save equipment</button></div>
@@ -2236,11 +2258,11 @@ export default function App() {
           </section>}
           {observationDraft && <div className="observation-modal-backdrop" role="dialog" aria-modal="true" aria-label="Complete observation details" onClick={(event) => { if (event.target === event.currentTarget) setObservationDraft(null); }}><form className="content-card observation-form" onSubmit={(event) => void handleCreateObservation(event)}>
             <div className="card-heading"><div><span className="card-kicker">{observationDraft.findingType === "NC" ? "NON-COMPLIANCE" : "OPPORTUNITY FOR IMPROVEMENT"}</span><h3>{observationDraft.observationId ? "Complete observation details" : `New ${observationDraft.findingType} observation`}</h3><p>{observationDraft.checkpointText}</p></div><button type="button" className="secondary-button" onClick={() => setObservationDraft(null)}>Cancel</button></div>
-            <div className="form-grid observation-grid"><label>Observation title <span>*</span><input value={observationTitle} onChange={e => setObservationTitle(e.target.value)} required /></label><label>Severity<select value={observationSeverity} onChange={e => setObservationSeverity(e.target.value)}><option value="">Unclassified</option><option>Minor</option><option>Major</option><option>Critical</option></select></label><label>Responsible person<input value={observationResponsible} onChange={e => setObservationResponsible(e.target.value)} placeholder="Name or role" /></label><label>Target closure date<input type="date" value={observationTargetDate} onChange={e => setObservationTargetDate(e.target.value)} /></label><label>Actual closure date<input type="date" value={observationClosureDate} onChange={e => setObservationClosureDate(e.target.value)} /></label><label className="wide-field">Description<textarea value={observationDescription} onChange={e => setObservationDescription(e.target.value)} rows={3} placeholder="Describe the finding..." /></label><label className="wide-field">{observationDraft.findingType === "NC" ? "Corrective action / Action taken" : "Improvement action / Action taken"}<textarea value={observationAction} onChange={e => setObservationAction(e.target.value)} rows={3} placeholder="Describe action taken or planned..." /></label></div>
+            <div className="form-grid observation-grid"><label>Observation title <span>*</span><input value={observationTitle} onChange={e => setObservationTitle(e.target.value)} required /></label>{observationDraft.findingType === "OFI" && <label>OFI Category <span>*</span><select value={observationOfiCategory} onChange={e => setObservationOfiCategory(e.target.value as OfiCategory | "")}><option value="">Select OFI category...</option><option value="Safety">Safety</option><option value="Profitability">Profitability</option><option value="Reliability">Reliability</option><option value="Aesthetic">Aesthetic</option></select></label>}<label>Severity<select value={observationSeverity} onChange={e => setObservationSeverity(e.target.value)}><option value="">Unclassified</option><option>Minor</option><option>Major</option><option>Critical</option></select></label><label>Responsible person<input value={observationResponsible} onChange={e => setObservationResponsible(e.target.value)} placeholder="Name or role" /></label><label>Target closure date<input type="date" value={observationTargetDate} onChange={e => setObservationTargetDate(e.target.value)} /></label><label>Actual closure date<input type="date" value={observationClosureDate} onChange={e => setObservationClosureDate(e.target.value)} /></label><label className="wide-field">Description<textarea value={observationDescription} onChange={e => setObservationDescription(e.target.value)} rows={3} placeholder="Describe the finding..." /></label><label className="wide-field">{observationDraft.findingType === "NC" ? "Corrective action / Action taken" : "Improvement action / Action taken"}<textarea value={observationAction} onChange={e => setObservationAction(e.target.value)} rows={3} placeholder="Describe action taken or planned..." /></label></div>
             {(() => { const linked = observations.find(o => o.id === observationDraft.observationId); const checkpointPhotos = linked?.photos ?? []; return <div className="observation-photo-panel"><h4>Observation photos</h4><p>Inspection photos captured at this checkpoint appear here automatically.</p>{checkpointPhotos.length > 0 ? <div className="checkpoint-photo-grid">{checkpointPhotos.map((photo, index) => <div className="checkpoint-photo-item" key={`source-${index}`}><div className="photo-thumb-wrap"><img className="photo-thumb-img" src={photo.src} alt={`Checkpoint inspection ${index + 1}`} onClick={() => setPreviewPhoto({ photo, label: `Inspection photo ${index + 1}` })} />{renderPhotoLocationBadge(photo)}</div><small>Inspection photo {index + 1}</small>{photo.remark && <small className="photo-remark-readonly">{photo.remark}</small>}</div>)}</div> : <small>No checkpoint photos attached.</small>}<h4>Photos of action taken</h4><div className="photo-action-buttons"><button type="button" className="secondary-button photo-capture-button" onClick={() => void takeObservationActionPhoto()}>📷 Capture Action Photo</button><label className="secondary-button photo-capture-button">🖼️ Choose from Gallery<input className="photo-file-input" type="file" accept="image/*" multiple onChange={(event) => { const files = Array.from(event.currentTarget.files ?? []); files.forEach(file => void addObservationActionPhoto(file)); event.currentTarget.value = ""; }} /></label></div>{observationActionPhotos.length > 0 && <div className="checkpoint-photo-grid">{observationActionPhotos.map((photo, index) => <div className="checkpoint-photo-item" key={`action-${index}`}><div className="photo-thumb-wrap"><img className="photo-thumb-img" src={photo.src} alt={`Action taken photo ${index + 1}`} onClick={() => setPreviewPhoto({ photo, label: `Action taken photo ${index + 1}` })} />{renderPhotoLocationBadge(photo)}</div><input type="text" className="photo-remark-input" placeholder="Add photo remark..." value={photo.remark ?? ""} onChange={(e) => setObservationActionPhotos((curr) => curr.map((item, i) => i === index ? { ...item, remark: e.target.value } : item))} /><button type="button" onClick={() => setObservationActionPhotos(current => current.filter((_, i) => i !== index))}>Remove</button></div>)}</div>}</div>; })()}
             <div className="form-actions"><button type="submit" className="primary-button">Save observation</button></div>
           </form></div>}
-          {visibleObservations.length === 0 ? <div className="empty-state large-empty"><div className="empty-icon"><Icon name="eye" /></div><h3>No observations yet</h3><p>Submit an audit with NC or OFI checkpoints to create observations here. Complete the follow-up details after submission.</p><button className="secondary-button" onClick={() => setSection("Audits")}>Go to audits <Icon name="arrow" /></button></div> : filteredObservations.length === 0 ? <div className="empty-state observation-no-results"><h3>No matching observations</h3><p>Try changing the search text or clearing one or more filters.</p><button type="button" className="secondary-button" onClick={() => { setObservationSearch(""); setObservationFindingFilter("ALL"); setObservationStatusFilter("all"); setObservationPlantFilter("all"); }}>Clear filters</button></div> : <div className="observation-list">{(() => { const plantGroups = new Map<string, LocalObservation[]>(); filteredObservations.forEach((o) => plantGroups.set(o.plantName || "Plant", [...(plantGroups.get(o.plantName || "Plant") ?? []), o])); return [...plantGroups.entries()].map(([plant, plantItems]) => { const auditGroups = new Map<string, LocalObservation[]>(); plantItems.forEach((o) => auditGroups.set(o.auditId, [...(auditGroups.get(o.auditId) ?? []), o])); return <details className="summary-observation-group observation-plant-group" key={plant} open><summary>{plant}<span>{plantItems.length} observation(s)</span></summary><div>{[...auditGroups.entries()].map(([auditId, auditItems]) => { return <details className="summary-observation-group" key={auditId}><summary>{auditItems[0]?.auditTitle || "Audit"}<span>{auditItems.length} observation(s)</span></summary><div>{auditItems.map((o) => <article className="content-card observation-row" key={o.id}><div className="observation-row-top"><span className={`finding-tag finding-${o.findingType.toLowerCase()}`}>{o.findingType}</span><span className={`observation-status status-${o.status}`}>{o.status}</span></div><h3>{o.title}</h3><p className="observation-meta">{o.checkpointText}</p>{o.description && <p>{o.description}</p>}<div className="observation-details"><span>Severity <b>{o.severity || "Unclassified"}</b></span><span>Responsible <b>{o.responsiblePerson || "Not assigned"}</b></span><span>Target date <b>{o.targetDate || "Not set"}</b></span></div>{o.actionText && <p><b>{o.findingType === "NC" ? "Corrective action / Action taken:" : "Improvement action / Action taken:"}</b> {o.actionText}</p>}{(o.photos?.length ?? 0) > 0 && <div className="observation-inline-photos"><b>Inspection photos</b><div className="checkpoint-photo-grid">{(o.photos ?? []).map((photo, index) => <div className="checkpoint-photo-item" key={`obs-${o.id}-${index}`}><div className="photo-thumb-wrap"><img className="photo-thumb-img" src={photo.src} alt={`Inspection photo ${index + 1}`} onClick={() => setPreviewPhoto({ photo, label: `${o.title} · Inspection photo ${index + 1}` })} />{renderPhotoLocationBadge(photo)}</div>{photo.remark && <small className="photo-remark-readonly">{photo.remark}</small>}</div>)}</div></div>}{(o.actionPhotos?.length ?? 0) > 0 && <div className="observation-inline-photos"><b>Action taken photos</b><div className="checkpoint-photo-grid">{(o.actionPhotos ?? []).map((photo, index) => <div className="checkpoint-photo-item" key={`obs-action-${o.id}-${index}`}><div className="photo-thumb-wrap"><img className="photo-thumb-img" src={photo.src} alt={`Action taken photo ${index + 1}`} onClick={() => setPreviewPhoto({ photo, label: `${o.title} · Action taken photo ${index + 1}` })} />{renderPhotoLocationBadge(photo)}</div>{photo.remark && <small className="photo-remark-readonly">{photo.remark}</small>}</div>)}</div></div>}<div className="observation-meta">{o.serverObservationId ? <span>Backend: {o.status.replace("_", " ")}</span> : <span>Local only{o.findingType === "OFI" ? " · awaiting audit sync" : " · awaiting audit sync"}</span>}{o.syncStatus === "error" && <span className="error-text">Sync issue: {o.syncError || "retry required"}</span>}</div><div className="form-actions"><button className="secondary-button" onClick={() => editObservation(o)}>Complete details</button>{o.serverObservationId && ["open", "in_progress", "rejected", "reopened"].includes(o.status) && <button className="primary-button" onClick={() => void submitObservationForReview(o)}>Submit for review</button>}</div></article>)}</div></details>; })}</div></details>; }); })()}</div>}
+          {visibleObservations.length === 0 ? <div className="empty-state large-empty"><div className="empty-icon"><Icon name="eye" /></div><h3>No observations yet</h3><p>Submit an audit with NC or OFI checkpoints to create observations here. Complete the follow-up details after submission.</p><button className="secondary-button" onClick={() => setSection("Audits")}>Go to audits <Icon name="arrow" /></button></div> : filteredObservations.length === 0 ? <div className="empty-state observation-no-results"><h3>No matching observations</h3><p>Try changing the search text or clearing one or more filters.</p><button type="button" className="secondary-button" onClick={() => { setObservationSearch(""); setObservationFindingFilter("ALL"); setObservationStatusFilter("all"); setObservationPlantFilter("all"); }}>Clear filters</button></div> : <div className="observation-list">{(() => { const plantGroups = new Map<string, LocalObservation[]>(); filteredObservations.forEach((o) => plantGroups.set(o.plantName || "Plant", [...(plantGroups.get(o.plantName || "Plant") ?? []), o])); return [...plantGroups.entries()].map(([plant, plantItems]) => { const auditGroups = new Map<string, LocalObservation[]>(); plantItems.forEach((o) => auditGroups.set(o.auditId, [...(auditGroups.get(o.auditId) ?? []), o])); return <details className="summary-observation-group observation-plant-group" key={plant} open><summary>{plant}<span>{plantItems.length} observation(s)</span></summary><div>{[...auditGroups.entries()].map(([auditId, auditItems]) => { return <details className="summary-observation-group" key={auditId}><summary>{auditItems[0]?.auditTitle || "Audit"}<span>{auditItems.length} observation(s)</span></summary><div>{auditItems.map((o) => <article className="content-card observation-row" key={o.id}><div className="observation-row-top"><span className={`finding-tag finding-${o.findingType.toLowerCase()}`}>{o.findingType}</span><span className={`observation-status status-${o.status}`}>{o.status}</span></div><h3>{o.title}</h3><p className="observation-meta">{o.checkpointText}</p>{o.description && <p>{o.description}</p>}<div className="observation-details"><span>Severity <b>{o.severity || "Unclassified"}</b></span>{o.findingType === "OFI" && <span>OFI Category <b>{o.ofiCategory || "Not selected"}</b></span>}<span>Responsible <b>{o.responsiblePerson || "Not assigned"}</b></span><span>Target date <b>{o.targetDate || "Not set"}</b></span></div>{o.actionText && <p><b>{o.findingType === "NC" ? "Corrective action / Action taken:" : "Improvement action / Action taken:"}</b> {o.actionText}</p>}{(o.photos?.length ?? 0) > 0 && <div className="observation-inline-photos"><b>Inspection photos</b><div className="checkpoint-photo-grid">{(o.photos ?? []).map((photo, index) => <div className="checkpoint-photo-item" key={`obs-${o.id}-${index}`}><div className="photo-thumb-wrap"><img className="photo-thumb-img" src={photo.src} alt={`Inspection photo ${index + 1}`} onClick={() => setPreviewPhoto({ photo, label: `${o.title} · Inspection photo ${index + 1}` })} />{renderPhotoLocationBadge(photo)}</div>{photo.remark && <small className="photo-remark-readonly">{photo.remark}</small>}</div>)}</div></div>}{(o.actionPhotos?.length ?? 0) > 0 && <div className="observation-inline-photos"><b>Action taken photos</b><div className="checkpoint-photo-grid">{(o.actionPhotos ?? []).map((photo, index) => <div className="checkpoint-photo-item" key={`obs-action-${o.id}-${index}`}><div className="photo-thumb-wrap"><img className="photo-thumb-img" src={photo.src} alt={`Action taken photo ${index + 1}`} onClick={() => setPreviewPhoto({ photo, label: `${o.title} · Action taken photo ${index + 1}` })} />{renderPhotoLocationBadge(photo)}</div>{photo.remark && <small className="photo-remark-readonly">{photo.remark}</small>}</div>)}</div></div>}<div className="observation-meta">{o.serverObservationId ? <span>Backend: {o.status.replace("_", " ")}</span> : <span>Local only{o.findingType === "OFI" ? " · awaiting audit sync" : " · awaiting audit sync"}</span>}{o.syncStatus === "error" && <span className="error-text">Sync issue: {o.syncError || "retry required"}</span>}</div><div className="form-actions"><button className="secondary-button" onClick={() => editObservation(o)}>Complete details</button>{o.serverObservationId && ["open", "in_progress", "rejected", "reopened"].includes(o.status) && <button className="primary-button" onClick={() => void submitObservationForReview(o)}>Submit for review</button>}</div></article>)}</div></details>; })}</div></details>; }); })()}</div>}
         </div>}
         {section === "Reports" && <div className="page-content">
           <div className="section-heading report-heading">
@@ -2311,7 +2333,7 @@ export default function App() {
           </section>
           <section className="content-card settings-card"><div className="danger-zone"><div><b>Sign out &amp; switch account</b><small>Clears the active workspace and returns to the login screen so another plant account can sign in.</small></div><button className="danger-button" onClick={resetWorkspace}>Sign out &amp; switch</button></div></section>
         </div>}
-        <footer className="main-footer"><span>Solar Audit Mobile</span><span>Offline-ready field inspection workspace</span></footer>
+        <footer className="main-footer"><span>CMES AssetCare</span><span>Offline-ready field inspection workspace</span></footer>
       </main>
       <nav className="mobile-nav" aria-label="Mobile navigation">{navItems.map((item) => <button key={item.label} className={section === item.label ? "mobile-nav-item active" : "mobile-nav-item"} onClick={() => { setSection(item.label); setMessage(""); }}><Icon name={item.icon} /><span>{item.label === "Sites & Plants" ? "Plants" : item.label}</span></button>)}</nav>
       {previewPhoto && (

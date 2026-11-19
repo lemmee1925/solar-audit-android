@@ -2,7 +2,7 @@ import type { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
   appId: 'com.cleanmax.solaraudit',
-  appName: 'Solar Audit Mobile',
+  appName: 'CMES AssetCare',
   webDir: 'dist',
   backgroundColor: '#f5f4ef',
   server: {

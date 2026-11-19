@@ -317,12 +317,16 @@ async function openDatabase(): Promise<SQLiteDBConnection | null> {
     if (!existingObservationColumns.has("server_observation_id")) await connection.execute("ALTER TABLE observations ADD COLUMN server_observation_id TEXT");
     if (!existingObservationColumns.has("sync_status")) await connection.execute("ALTER TABLE observations ADD COLUMN sync_status TEXT NOT NULL DEFAULT 'local'");
     if (!existingObservationColumns.has("sync_error")) await connection.execute("ALTER TABLE observations ADD COLUMN sync_error TEXT NOT NULL DEFAULT ''");
+    if (!existingObservationColumns.has("ofi_category")) await connection.execute("ALTER TABLE observations ADD COLUMN ofi_category TEXT NOT NULL DEFAULT ''");
 
     await migrateLegacyWorkspace(connection);
     const checkpointColumns = await connection.query("PRAGMA table_info(audit_checkpoints)");
     const existingCheckpointColumns = new Set((checkpointColumns.values ?? []).map((row) => String(row.name)));
     if (!existingCheckpointColumns.has("photos_json")) {
       await connection.execute("ALTER TABLE audit_checkpoints ADD COLUMN photos_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!existingCheckpointColumns.has("ofi_category")) {
+      await connection.execute("ALTER TABLE audit_checkpoints ADD COLUMN ofi_category TEXT NOT NULL DEFAULT ''");
     }
 
     // Migrate older checkpoint tables whose CHECK constraint only allowed C/NC/NA.
@@ -770,11 +774,14 @@ export async function createAudit(input: {
 }
 
 
+export type OfiCategory = "Safety" | "Profitability" | "Reliability" | "Aesthetic";
+
 export type AuditCheckpoint = {
   id: string;
   equipmentId: string;
   checkpointText: string;
   result: "C" | "NC" | "NA" | "OFI";
+  ofiCategory?: OfiCategory | "";
   remarks: string;
   photos: PhotoItem[];
   updatedAt: string;
@@ -854,7 +861,7 @@ export async function loadAuditExecution(auditId: string): Promise<AuditEquipmen
   for (const row of equipmentRows.values ?? []) {
     const equipmentId = String(row.id);
     const checkpointRows = await db.query(
-      "SELECT id, equipment_id, checkpoint_text, result, remarks, photos_json, updated_at FROM audit_checkpoints WHERE audit_id = ? AND equipment_id = ? ORDER BY rowid",
+      "SELECT id, equipment_id, checkpoint_text, result, ofi_category, remarks, photos_json, updated_at FROM audit_checkpoints WHERE audit_id = ? AND equipment_id = ? ORDER BY rowid",
       [auditId, equipmentId],
     );
     const checkpoints: AuditCheckpoint[] = [];
@@ -864,6 +871,7 @@ export async function loadAuditExecution(auditId: string): Promise<AuditEquipmen
         equipmentId,
         checkpointText: String(cp.checkpoint_text ?? ""),
         result: String(cp.result ?? "NA") as AuditCheckpoint["result"],
+        ofiCategory: String(cp.ofi_category ?? "") as OfiCategory | "",
         remarks: String(cp.remarks ?? ""),
         photos: await resolvePhotosFromFilesystem(cp.photos_json),
         updatedAt: String(cp.updated_at ?? ""),
@@ -929,9 +937,10 @@ export async function updateAuditCheckpoint(auditId: string, checkpoint: AuditCh
     return;
   }
   const storedPhotos = await persistPhotosToFilesystem(checkpoint.photos ?? [], checkpoint.id);
+  const ofiCategory = checkpoint.result === "OFI" ? (checkpoint.ofiCategory ?? "") : "";
   await db.run(
-    "UPDATE audit_checkpoints SET result = ?, remarks = ?, photos_json = ?, updated_at = ? WHERE id = ? AND audit_id = ?",
-    [checkpoint.result, checkpoint.remarks, JSON.stringify(storedPhotos), now, checkpoint.id, auditId],
+    "UPDATE audit_checkpoints SET result = ?, ofi_category = ?, remarks = ?, photos_json = ?, updated_at = ? WHERE id = ? AND audit_id = ?",
+    [checkpoint.result, ofiCategory, checkpoint.remarks, JSON.stringify(storedPhotos), now, checkpoint.id, auditId],
   );
   await db.run("UPDATE audits SET status = 'in_progress', updated_at = ? WHERE id = ?", [now, auditId]);
 }
@@ -947,7 +956,7 @@ export type FindingType = "NC" | "OFI";
 export type ObservationStatus = "open" | "in_progress" | "submitted" | "closed" | "rejected" | "reopened" | "withdrawn";
 export type LocalObservation = {
   id: string; auditId: string; auditTitle: string; plantName: string; checkpointId: string | null;
-  checkpointText: string; findingType: FindingType; title: string; description: string; severity: string;
+  checkpointText: string; findingType: FindingType; ofiCategory?: OfiCategory | ""; title: string; description: string; severity: string;
   responsiblePerson: string; actionText: string; status: ObservationStatus; targetDate: string; closureDate: string;
   createdAt: string; updatedAt: string; photos: PhotoItem[]; actionPhotos: PhotoItem[];
   equipmentName?: string; equipmentType?: string; serverObservationId?: string; syncStatus?: "local" | "synced" | "pending" | "error"; syncError?: string;
@@ -979,6 +988,7 @@ export async function loadObservations(): Promise<LocalObservation[]> {
       syncStatus: String(r.sync_status ?? "local") as LocalObservation["syncStatus"],
       syncError: String(r.sync_error ?? ""),
       findingType: String(r.finding_type ?? "NC") as FindingType,
+      ofiCategory: String(r.ofi_category ?? "") as OfiCategory | "",
       title: String(r.title ?? ""),
       description: String(r.description ?? ""),
       severity: String(r.severity ?? ""),
@@ -995,16 +1005,17 @@ export async function loadObservations(): Promise<LocalObservation[]> {
   }
   return items;
 }
-export async function createObservation(input: { auditId: string; checkpointId: string; findingType: FindingType; title: string; description: string; severity: string; responsiblePerson: string; actionText: string; targetDate: string }): Promise<string> {
+export async function createObservation(input: { auditId: string; checkpointId: string; findingType: FindingType; ofiCategory?: OfiCategory | ""; title: string; description: string; severity: string; responsiblePerson: string; actionText: string; targetDate: string }): Promise<string> {
   const now = new Date().toISOString(); const id = crypto.randomUUID();
+  const ofiCategory = input.findingType === "OFI" ? (input.ofiCategory ?? "") : "";
   const db = await (dbPromise ??= openDatabase());
   if (!db) {
     const audits = readBrowserAudits(); const audit = audits.find(a => a.id === input.auditId);
     const execution = readBrowserExecution(); const eq = Object.values(execution).flatMap(x => x).find(e => e.checkpoints.some(c => c.id === input.checkpointId)); const cp = eq?.checkpoints.find(c => c.id === input.checkpointId);
-    const item: LocalObservation = { id, auditId: input.auditId, auditTitle: audit?.title ?? '', plantName: audit?.plantName ?? '', checkpointId: input.checkpointId, checkpointText: cp?.checkpointText ?? '', equipmentName: eq?.name ?? '', equipmentType: eq?.equipmentType ?? '', syncStatus: 'local', photos: cp?.photos ?? [], actionPhotos: [], findingType: input.findingType, title: input.title.trim(), description: input.description.trim(), severity: input.severity, responsiblePerson: input.responsiblePerson.trim(), actionText: input.actionText.trim(), status: 'open', targetDate: input.targetDate, closureDate: '', createdAt: now, updatedAt: now };
+    const item: LocalObservation = { id, auditId: input.auditId, auditTitle: audit?.title ?? '', plantName: audit?.plantName ?? '', checkpointId: input.checkpointId, checkpointText: cp?.checkpointText ?? '', equipmentName: eq?.name ?? '', equipmentType: eq?.equipmentType ?? '', syncStatus: 'local', photos: cp?.photos ?? [], actionPhotos: [], findingType: input.findingType, ofiCategory: ofiCategory || cp?.ofiCategory || "", title: input.title.trim(), description: input.description.trim(), severity: input.severity, responsiblePerson: input.responsiblePerson.trim(), actionText: input.actionText.trim(), status: 'open', targetDate: input.targetDate, closureDate: '', createdAt: now, updatedAt: now };
     localStorage.setItem(OBSERVATIONS_KEY, JSON.stringify([item, ...readBrowserObservations()])); return id;
   }
-  await db.run(`INSERT INTO observations (id,audit_id,checkpoint_id,title,description,finding_type,severity,responsible_person,action_text,status,target_date,server_observation_id,sync_status,sync_error,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,'open',?,NULL,'local','',?,?)`, [id, input.auditId, input.checkpointId, input.title.trim(), input.description.trim(), input.findingType, input.severity, input.responsiblePerson.trim(), input.actionText.trim(), input.targetDate || null, now, now]);
+  await db.run(`INSERT INTO observations (id,audit_id,checkpoint_id,title,description,finding_type,ofi_category,severity,responsible_person,action_text,status,target_date,server_observation_id,sync_status,sync_error,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,'open',?,NULL,'local','',?,?)`, [id, input.auditId, input.checkpointId, input.title.trim(), input.description.trim(), input.findingType, ofiCategory, input.severity, input.responsiblePerson.trim(), input.actionText.trim(), input.targetDate || null, now, now]);
   return id;
 }
 
@@ -1122,7 +1133,7 @@ export async function markAuditSubmitted(auditId: string): Promise<void> {
 }
 
 export async function updateObservationDetails(input: {
-  id: string; title: string; description: string; severity: string;
+  id: string; title: string; description: string; severity: string; ofiCategory?: OfiCategory | "";
   responsiblePerson: string; actionText: string; targetDate: string; closureDate?: string;
 }): Promise<void> {
   const now = new Date().toISOString();
@@ -1130,6 +1141,7 @@ export async function updateObservationDetails(input: {
   if (!db) {
     const items = readBrowserObservations().map((o) => o.id === input.id ? {
       ...o, title: input.title.trim(), description: input.description.trim(), severity: input.severity,
+      ofiCategory: input.ofiCategory !== undefined ? input.ofiCategory : o.ofiCategory,
       responsiblePerson: input.responsiblePerson.trim(), actionText: input.actionText.trim(),
       targetDate: input.targetDate, closureDate: input.closureDate ?? o.closureDate, syncStatus: 'pending' as const, updatedAt: now,
     } : o);
@@ -1137,7 +1149,7 @@ export async function updateObservationDetails(input: {
     return;
   }
   await db.run(
-    "UPDATE observations SET title=?, description=?, severity=?, responsible_person=?, action_text=?, target_date=?, closure_date=?, sync_status='pending', updated_at=? WHERE id=?",
-    [input.title.trim(), input.description.trim(), input.severity, input.responsiblePerson.trim(), input.actionText.trim(), input.targetDate || null, input.closureDate || null, now, input.id],
+    "UPDATE observations SET title=?, description=?, severity=?, ofi_category=COALESCE(?, ofi_category), responsible_person=?, action_text=?, target_date=?, closure_date=?, sync_status='pending', updated_at=? WHERE id=?",
+    [input.title.trim(), input.description.trim(), input.severity, input.ofiCategory ?? null, input.responsiblePerson.trim(), input.actionText.trim(), input.targetDate || null, input.closureDate || null, now, input.id],
   );
 }
