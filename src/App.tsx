@@ -213,6 +213,7 @@ export default function App() {
   const [summaryAudit, setSummaryAudit] = useState<LocalAudit | null>(null);
   const [executionEquipment, setExecutionEquipment] = useState<AuditEquipment[]>([]);
   const [selectedEquipmentId, setSelectedEquipmentId] = useState("");
+  const [customCheckpointDrafts, setCustomCheckpointDrafts] = useState<Record<string, string>>({});
   const [equipmentName, setEquipmentName] = useState("");
   const [equipmentType, setEquipmentType] = useState("");
   const [observations, setObservations] = useState<LocalObservation[]>([]);
@@ -627,7 +628,7 @@ export default function App() {
               equipment.checkpoints.map((cp, ci) => {
                 const resultColor: [number, number, number] = cp.result === "C" ? [83, 132, 65] : cp.result === "NC" ? [201, 77, 77] : [110, 118, 126];
                 return {
-                  cells: [String(ci + 1), cp.checkpointText || "Checkpoint", statusLabel(cp.result), cp.remarks || "—"],
+                  cells: [String(ci + 1), cp.checkpointText || "Checkpoint", cp.result === "OFI" && cp.ofiCategory ? `OFI (${cp.ofiCategory})` : statusLabel(cp.result), cp.remarks || "—"],
                   boldCols: [2],
                   colorCols: { 2: resultColor },
                 };
@@ -690,7 +691,7 @@ export default function App() {
           auditObservations.map((o, i) => ({
             cells: [
               String(i + 1),
-              `${o.title || "Finding"}\n${o.checkpointText || ""}`,
+              `${o.title || "Finding"}${o.findingType === "OFI" && o.ofiCategory ? ` [OFI · ${o.ofiCategory}]` : ""}\n${o.checkpointText || ""}`,
               `${o.description || "(no observation text)"}${o.actionText ? `\nAction taken: ${o.actionText}` : ""}`,
               o.severity || "Not set",
               o.responsiblePerson || "N/A",
@@ -1255,6 +1256,23 @@ export default function App() {
     }
   }
 
+  async function handleAddCustomCheckpoint(equipmentId: string) {
+    if (!activeAudit || activeAudit.status === "submitted") return;
+    const text = (customCheckpointDrafts[equipmentId] ?? "").trim();
+    if (!text) return;
+    try {
+      const created = await addAuditCheckpoint(activeAudit.id, equipmentId, text);
+      setExecutionEquipment((current) => current.map((eq) => eq.id === equipmentId
+        ? { ...eq, checkpoints: [...eq.checkpoints, created] }
+        : eq));
+      setCustomCheckpointDrafts((curr) => ({ ...curr, [equipmentId]: "" }));
+      setMessage("Other checkpoint added.");
+    } catch (error) {
+      console.error("[Solar Audit] Add custom checkpoint failed:", error);
+      setMessage("Could not add custom checkpoint. Please retry.");
+    }
+  }
+
   async function takeCheckpointPhoto(equipmentId: string, checkpoint: AuditCheckpoint) {
     if (!activeAudit || activeAudit.status === "submitted") return;
     try {
@@ -1540,6 +1558,7 @@ export default function App() {
             latestServer = await saveServerObservationDetails(serverBaseUrl, serverToken, serverItem.id, {
               observation: effectiveObservationText,
               severity: localItem.severity.toLowerCase(),
+              ofi_category: localItem.findingType === "OFI" ? (localItem.ofiCategory || "") : undefined,
               responsible_person: localItem.responsiblePerson,
               target_date: localItem.targetDate,
             });
@@ -1576,6 +1595,7 @@ export default function App() {
           id: localItem.id,
           serverObservationId: latestServer.id,
           findingType: latestFindingType,
+          ofiCategory: (latestServer.ofi_category || "") as OfiCategory | "",
           checkpointId: resolvedCheckpointId,
           serverUpdatedAt: latestServer.updated_at,
           status: latestServer.status,
@@ -1810,7 +1830,7 @@ export default function App() {
     existingObservations: LocalObservation[],
   ): {
     payload: AuditManifestPayload;
-    photoQueue: Array<{ checkpointId: string; photoIndex: number; photo: PhotoItem; questionId: number; assetRef: string }>;
+    photoQueue: Array<{ checkpointId: string; photoIndex: number; photo: PhotoItem; questionId: number; checkpointKey: string; assetRef: string }>;
   } {
     const localPlantName =
       audit.plantName ||
@@ -1833,7 +1853,7 @@ export default function App() {
 
     const assets: AuditManifestPayload["assets"] = [];
     const responses: AuditManifestPayload["responses"] = [];
-    const photoQueue: Array<{ checkpointId: string; photoIndex: number; photo: PhotoItem; questionId: number; assetRef: string }> = [];
+    const photoQueue: Array<{ checkpointId: string; photoIndex: number; photo: PhotoItem; questionId: number; checkpointKey: string; assetRef: string }> = [];
     for (const eq of execution) {
       const typeNorm = normalizeMappingText(eq.equipmentType);
       const isSafety = typeNorm.includes("safety");
@@ -1849,7 +1869,8 @@ export default function App() {
       for (const cp of eq.checkpoints) {
         const questionTypeName = isSafety ? "Site Safety" : isCivil ? "Civil / Infrastructure" : String(serverType?.name ?? "");
         const questionMatches = ref.checklist.questions.filter((q: any) => normalizeMappingText(q.text) === normalizeMappingText(cp.checkpointText) && normalizeMappingText(q.asset_type_name) === normalizeMappingText(questionTypeName));
-        if (questionMatches.length !== 1) throw new Error(`Checkpoint “${cp.checkpointText}” has ${questionMatches.length} exact server question matches for “${questionTypeName}”. No data was uploaded.`);
+        if (questionMatches.length > 1) throw new Error(`Checkpoint “${cp.checkpointText}” has ${questionMatches.length} exact server question matches for “${questionTypeName}”. No data was uploaded.`);
+        const resolvedQuestionId = questionMatches.length === 1 ? Number(questionMatches[0].id) : null;
         const result = cp.result === "C" ? "pass" : cp.result === "NC" ? "fail" : cp.result === "OFI" ? "ofi" : "na";
         const localObs = existingObservations.find((o) =>
           o.auditId === audit.id &&
@@ -1858,8 +1879,17 @@ export default function App() {
         const obsText = (cp.result === "NC" || cp.result === "OFI")
           ? (localObs?.description?.trim() || cp.remarks?.trim() || "")
           : "";
-        responses.push({ asset_ref: assetRef, question_id: Number(questionMatches[0].id), response_status: result, ofi_category: cp.result === "OFI" ? (cp.ofiCategory || localObs?.ofiCategory || "") : "", remarks: cp.remarks || "", observation: obsText });
-        (cp.photos ?? []).forEach((photo, photoIndex) => photoQueue.push({ checkpointId: cp.id, photoIndex, photo, questionId: Number(questionMatches[0].id), assetRef }));
+        responses.push({
+          asset_ref: assetRef,
+          question_id: resolvedQuestionId,
+          ...(resolvedQuestionId === null ? { checkpoint_text: cp.checkpointText.trim() } : {}),
+          response_status: result,
+          ofi_category: cp.result === "OFI" ? (cp.ofiCategory || localObs?.ofiCategory || "") : "",
+          remarks: cp.remarks || "",
+          observation: obsText,
+        });
+        const checkpointKey = `${assetRef}::${cp.checkpointText.trim()}`;
+        (cp.photos ?? []).forEach((photo, photoIndex) => photoQueue.push({ checkpointId: cp.id, photoIndex, photo, questionId: resolvedQuestionId ?? 0, checkpointKey, assetRef }));
       }
     }
     const payload: AuditManifestPayload = {
@@ -1896,8 +1926,10 @@ export default function App() {
           ? String(acknowledgement.asset_map?.[item.assetRef] ?? "")
           : undefined;
         if (!["Site Safety", "Civil / Infrastructure"].includes(item.assetRef) && !serverAssetId) continue;
+        const resolvedQid = item.questionId || Number(acknowledgement.question_map?.[item.checkpointKey] ?? 0);
+        if (!resolvedQid) continue;
         await syncAuditPhoto(serverBaseUrl, serverToken, audit.id, photoId, {
-          question_id: item.questionId,
+          question_id: resolvedQid,
           asset_ref: item.assetRef,
           asset_id: serverAssetId,
           dataUrl,
@@ -1992,8 +2024,12 @@ export default function App() {
             if (!["Site Safety", "Civil / Infrastructure"].includes(item.assetRef) && !serverAssetId) {
               throw new Error(`Backend did not return a server equipment ID for asset reference “${item.assetRef}”. Re-sync the audit manifest before uploading its photos.`);
             }
+            const resolvedQid = item.questionId || Number(acknowledgement.question_map?.[item.checkpointKey] ?? 0);
+            if (!resolvedQid) {
+              throw new Error(`Backend did not return a server question ID for checkpoint “${item.checkpointKey}”.`);
+            }
             await syncAuditPhoto(serverBaseUrl, serverToken, audit.id, photoId, {
-              question_id: item.questionId,
+              question_id: resolvedQid,
               asset_ref: item.assetRef,
               asset_id: serverAssetId,
               dataUrl,
@@ -2219,7 +2255,7 @@ export default function App() {
                 <div className="equipment-card-heading"><div><h4>{equipment.name}</h4><small>{equipment.equipmentType || "Equipment"} · {equipment.checkpoints.length} checkpoint(s)</small></div></div>
                 {equipment.checkpoints.length > 0 && <div className="checkpoint-list">{equipment.checkpoints.map((checkpoint) => <div className="checkpoint-card" key={checkpoint.id}>
                   <div className="checkpoint-title"><b>{checkpoint.checkpointText}</b><span className={`result-pill result-${checkpoint.result.toLowerCase()}`}>{checkpoint.result}</span></div>
-                  <div className="result-selector" role="group" aria-label={`Result for ${checkpoint.checkpointText}`}>{(["C", "NC", "NA", "OFI"] as const).map((result) => <button type="button" key={result} className={checkpoint.result === result ? `result-option selected result-${result.toLowerCase()}` : "result-option"} onClick={() => void handleCheckpointChange(equipment.id, checkpoint, { result })}>{result === "C" ? "Compliant (C)" : result === "NC" ? "Non-Compliant (NC)" : result === "NA" ? "Not Applicable (NA)" : "Opportunity for Improvement (OFI)"}</button>)}</div>
+                  <div className="result-selector" role="group" aria-label={`Result for ${checkpoint.checkpointText}`}>{(["C", "NA", "OFI"] as const).map((result) => <button type="button" key={result} className={checkpoint.result === result ? `result-option selected result-${result.toLowerCase()}` : "result-option"} onClick={() => void handleCheckpointChange(equipment.id, checkpoint, { result })}>{result === "C" ? "Compliant (C)" : result === "NA" ? "Not Applicable (NA)" : "Opportunity for Improvement (OFI)"}</button>)}</div>
                   {checkpoint.result === "OFI" && (
                     <label className="ofi-category-label">
                       OFI Category <span>*</span>
@@ -2238,6 +2274,23 @@ export default function App() {
                   )}
                   <label className="remarks-label">Remarks<textarea value={checkpoint.remarks} onChange={(e) => void handleCheckpointChange(equipment.id, checkpoint, { remarks: e.target.value })} placeholder="Add inspection remarks..." rows={2} /></label><div className="checkpoint-photos"><div className="checkpoint-photo-heading"><b>Inspection photos</b><small>{(checkpoint.photos ?? []).length} saved</small></div><div className="photo-action-buttons"><button type="button" className="secondary-button photo-capture-button" disabled={activeAudit.status === "submitted"} onClick={() => void takeCheckpointPhoto(equipment.id, checkpoint)}>📷 Take Photo</button><label className="secondary-button photo-capture-button">🖼️ Choose from Gallery<input className="photo-file-input" type="file" accept="image/*" multiple disabled={activeAudit.status === "submitted"} onChange={(event) => { void handleCheckpointPhotos(equipment.id, checkpoint, event.currentTarget.files); event.currentTarget.value = ""; }} /></label></div>{(checkpoint.photos ?? []).length > 0 && <div className="checkpoint-photo-grid">{(checkpoint.photos ?? []).map((photo, photoIndex) => <div className="checkpoint-photo-item" key={`${checkpoint.id}-photo-${photoIndex}`}><div className="photo-thumb-wrap"><img className="photo-thumb-img" src={photo.src} alt={`Inspection photo ${photoIndex + 1}`} onClick={() => setPreviewPhoto({ photo, label: `Inspection photo ${photoIndex + 1}` })} />{renderPhotoLocationBadge(photo)}</div><input type="text" className="photo-remark-input" placeholder="Add photo remark..." value={photo.remark ?? ""} disabled={activeAudit.status === "submitted"} onChange={(e) => void updateCheckpointPhotoRemark(equipment.id, checkpoint, photoIndex, e.target.value)} /><button type="button" disabled={activeAudit.status === "submitted"} aria-label={`Remove photo ${photoIndex + 1}`} onClick={() => void removeCheckpointPhoto(equipment.id, checkpoint, photoIndex)}>Remove</button></div>)}</div>}<small className="photo-storage-note">Photos are compressed and saved locally with this checkpoint for offline use.</small></div>
                 </div>)}</div>}
+                <div className="custom-checkpoint-row">
+                  <input
+                    type="text"
+                    value={customCheckpointDrafts[equipment.id] ?? ""}
+                    disabled={activeAudit.status === "submitted"}
+                    placeholder="Other checkpoint (add custom point)..."
+                    onChange={(e) => setCustomCheckpointDrafts((curr) => ({ ...curr, [equipment.id]: e.target.value }))}
+                  />
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={activeAudit.status === "submitted" || !(customCheckpointDrafts[equipment.id] ?? "").trim()}
+                    onClick={() => void handleAddCustomCheckpoint(equipment.id)}
+                  >
+                    + Add Other Checkpoint
+                  </button>
+                </div>
                 <div className="equipment-save-row"><button type="button" className="secondary-button" disabled={activeAudit.status === "submitted"} onClick={() => setMessage(`${equipment.name}: equipment and checkpoint changes are saved on this device.`)}>Save equipment</button></div>
               </article>)}
             </>}

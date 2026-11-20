@@ -1023,7 +1023,7 @@ export async function createObservation(input: { auditId: string; checkpointId: 
 export async function linkObservationToServer(input: {
   id: string; serverObservationId: string; status: string; severity: string;
   responsiblePerson: string; description: string; actionText: string;
-  targetDate: string; closureDate: string; findingType?: FindingType;
+  targetDate: string; closureDate: string; findingType?: FindingType; ofiCategory?: OfiCategory | "";
   checkpointId?: string | null; serverUpdatedAt?: string | null; preserveLocal?: boolean;
 }): Promise<void> {
   const now = input.serverUpdatedAt || new Date().toISOString();
@@ -1032,9 +1032,9 @@ export async function linkObservationToServer(input: {
   const severity = input.severity ? input.severity.charAt(0).toUpperCase() + input.severity.slice(1).toLowerCase() : "";
   if (!db) {
     const items = readBrowserObservations().map((o) => o.id === input.id ? (input.preserveLocal ? {
-      ...o, serverObservationId: input.serverObservationId, findingType: input.findingType ?? o.findingType, checkpointId: input.checkpointId ?? o.checkpointId, syncStatus: "pending" as const, syncError: "", updatedAt: now,
+      ...o, serverObservationId: input.serverObservationId, findingType: input.findingType ?? o.findingType, ofiCategory: input.ofiCategory !== undefined ? input.ofiCategory : o.ofiCategory, checkpointId: input.checkpointId ?? o.checkpointId, syncStatus: "pending" as const, syncError: "", updatedAt: now,
     } : {
-      ...o, serverObservationId: input.serverObservationId, findingType: input.findingType ?? o.findingType, checkpointId: input.checkpointId ?? o.checkpointId, syncStatus: "synced" as const, syncError: "",
+      ...o, serverObservationId: input.serverObservationId, findingType: input.findingType ?? o.findingType, ofiCategory: input.ofiCategory !== undefined ? input.ofiCategory : o.ofiCategory, checkpointId: input.checkpointId ?? o.checkpointId, syncStatus: "synced" as const, syncError: "",
       status, severity, responsiblePerson: input.responsiblePerson, description: input.description,
       actionText: input.actionText, targetDate: input.targetDate, closureDate: input.closureDate, updatedAt: now,
     }) : o);
@@ -1042,12 +1042,12 @@ export async function linkObservationToServer(input: {
     return;
   }
   if (input.preserveLocal) {
-    await db.run("UPDATE observations SET server_observation_id=?, finding_type=COALESCE(?, finding_type), checkpoint_id=COALESCE(?, checkpoint_id), sync_status='pending', sync_error='', updated_at=? WHERE id=?",
-      [input.serverObservationId, input.findingType ?? null, input.checkpointId ?? null, now, input.id]);
+    await db.run("UPDATE observations SET server_observation_id=?, finding_type=COALESCE(?, finding_type), ofi_category=COALESCE(?, ofi_category), checkpoint_id=COALESCE(?, checkpoint_id), sync_status='pending', sync_error='', updated_at=? WHERE id=?",
+      [input.serverObservationId, input.findingType ?? null, input.ofiCategory ?? null, input.checkpointId ?? null, now, input.id]);
     return;
   }
-  await db.run(`UPDATE observations SET server_observation_id=?, finding_type=COALESCE(?, finding_type), checkpoint_id=COALESCE(?, checkpoint_id), sync_status='synced', sync_error='', status=?, severity=?, responsible_person=?, description=?, action_text=?, target_date=?, closure_date=?, updated_at=? WHERE id=?`,
-    [input.serverObservationId, input.findingType ?? null, input.checkpointId ?? null, status, severity, input.responsiblePerson, input.description, input.actionText, input.targetDate || null, input.closureDate || null, now, input.id]);
+  await db.run(`UPDATE observations SET server_observation_id=?, finding_type=COALESCE(?, finding_type), ofi_category=COALESCE(?, ofi_category), checkpoint_id=COALESCE(?, checkpoint_id), sync_status='synced', sync_error='', status=?, severity=?, responsible_person=?, description=?, action_text=?, target_date=?, closure_date=?, updated_at=? WHERE id=?`,
+    [input.serverObservationId, input.findingType ?? null, input.ofiCategory ?? null, input.checkpointId ?? null, status, severity, input.responsiblePerson, input.description, input.actionText, input.targetDate || null, input.closureDate || null, now, input.id]);
 }
 
 export async function deleteObservation(id: string): Promise<void> {

@@ -1836,3 +1836,23 @@
   color: #1f2b22;
   font-size: 12px;
 }
+
+.custom-checkpoint-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 14px 0 6px;
+  padding-top: 12px;
+  border-top: 1px dashed #dce4dd;
+}
+.custom-checkpoint-row input {
+  flex: 1 1 200px;
+  min-width: 0;
+  height: 40px;
+  padding: 0 11px;
+  border: 1px solid #cfdcd0;
+  border-radius: 9px;
+  background: #fbfdfb;
+  color: #1f2b22;
+  font-size: 12px;
+}

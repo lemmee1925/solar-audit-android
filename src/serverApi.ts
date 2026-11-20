@@ -209,12 +209,12 @@ export type AuditManifestPayload = {
   state: string;
   asset_id_ref: string;
   assets: Array<{ asset_ref: string; asset_type_id: number; asset_name: string; location: string; rank: string; observation: string; remarks: string; is_audited: boolean }>;
-  responses: Array<{ asset_ref: string; question_id: number; response_status: "pass" | "fail" | "na" | "ofi"; ofi_category?: string; remarks: string; observation: string }>;
+  responses: Array<{ asset_ref: string; question_id: number | null; checkpoint_text?: string; response_status: "pass" | "fail" | "na" | "ofi"; ofi_category?: string; remarks: string; observation: string }>;
 };
 
 export async function syncAuditManifest(
   baseUrl: string, token: string, localAuditId: string, payload: AuditManifestPayload,
-): Promise<{ ok: boolean; local_uuid: string; audit_id: string; audit_number: string | number; status: string; asset_map: Record<string, string>; already_submitted?: boolean }> {
+): Promise<{ ok: boolean; local_uuid: string; audit_id: string; audit_number: string | number; status: string; asset_map: Record<string, string>; question_map?: Record<string, number>; already_submitted?: boolean }> {
   const base = normalizeBaseUrl(baseUrl);
   if (!token.trim()) throw new Error("Sign in to the native API before syncing.");
   if (payload.local_uuid !== localAuditId) throw new Error("Local audit ID mismatch; sync was stopped.");
@@ -370,7 +370,7 @@ export async function fetchServerObservations(
 
 export async function saveServerObservationDetails(
   baseUrl: string, token: string, observationId: string,
-  details: { observation: string; remarks?: string; severity: string; responsible_person: string; target_date: string },
+  details: { observation: string; remarks?: string; severity: string; ofi_category?: string; responsible_person: string; target_date: string },
 ): Promise<ServerObservation> {
   const body = await authenticatedJson(baseUrl, token, `/observations/${encodeURIComponent(observationId)}/details`, "POST", details);
   if (!body.observation?.id) throw new Error("The server did not confirm observation details.");
