@@ -236,6 +236,7 @@ async function openDatabase(): Promise<SQLiteDBConnection | null> {
         equipment_id TEXT REFERENCES audit_equipment(id) ON DELETE CASCADE,
         checkpoint_text TEXT NOT NULL,
         result TEXT NOT NULL DEFAULT 'NA' CHECK (result IN ('C','NC','NA','OFI')),
+        ofi_category TEXT NOT NULL DEFAULT '',
         remarks TEXT NOT NULL DEFAULT '',
         photos_json TEXT NOT NULL DEFAULT '[]',
         updated_at TEXT NOT NULL
@@ -247,6 +248,7 @@ async function openDatabase(): Promise<SQLiteDBConnection | null> {
         title TEXT NOT NULL,
         description TEXT NOT NULL DEFAULT '',
         finding_type TEXT NOT NULL DEFAULT 'NC',
+        ofi_category TEXT NOT NULL DEFAULT '',
         severity TEXT NOT NULL DEFAULT 'Minor',
         responsible_person TEXT NOT NULL DEFAULT '',
         action_text TEXT NOT NULL DEFAULT '',
@@ -320,14 +322,6 @@ async function openDatabase(): Promise<SQLiteDBConnection | null> {
     if (!existingObservationColumns.has("ofi_category")) await connection.execute("ALTER TABLE observations ADD COLUMN ofi_category TEXT NOT NULL DEFAULT ''");
 
     await migrateLegacyWorkspace(connection);
-    const checkpointColumns = await connection.query("PRAGMA table_info(audit_checkpoints)");
-    const existingCheckpointColumns = new Set((checkpointColumns.values ?? []).map((row) => String(row.name)));
-    if (!existingCheckpointColumns.has("photos_json")) {
-      await connection.execute("ALTER TABLE audit_checkpoints ADD COLUMN photos_json TEXT NOT NULL DEFAULT '[]'");
-    }
-    if (!existingCheckpointColumns.has("ofi_category")) {
-      await connection.execute("ALTER TABLE audit_checkpoints ADD COLUMN ofi_category TEXT NOT NULL DEFAULT ''");
-    }
 
     // Migrate older checkpoint tables whose CHECK constraint only allowed C/NC/NA.
     // Keep all existing checkpoint records and preserve the observations FK target.
@@ -335,7 +329,7 @@ async function openDatabase(): Promise<SQLiteDBConnection | null> {
       "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'audit_checkpoints'",
     );
     const checkpointSql = String(checkpointSchema.values?.[0]?.sql ?? "");
-    if (checkpointSql.includes("'C','NC','NA'") || checkpointSql.includes("'C', 'NC', 'NA'")) {
+    if (!checkpointSql.includes("'OFI'") && (checkpointSql.includes("'C','NC','NA'") || checkpointSql.includes("'C', 'NC', 'NA'"))) {
       await connection.execute("PRAGMA foreign_keys = OFF;");
       await connection.execute(`
         CREATE TABLE audit_checkpoints_new (
@@ -344,6 +338,7 @@ async function openDatabase(): Promise<SQLiteDBConnection | null> {
           equipment_id TEXT REFERENCES audit_equipment(id) ON DELETE CASCADE,
           checkpoint_text TEXT NOT NULL,
           result TEXT NOT NULL DEFAULT 'NA' CHECK (result IN ('C','NC','NA','OFI')),
+          ofi_category TEXT NOT NULL DEFAULT '',
           remarks TEXT NOT NULL DEFAULT '',
           photos_json TEXT NOT NULL DEFAULT '[]',
           updated_at TEXT NOT NULL
@@ -355,6 +350,15 @@ async function openDatabase(): Promise<SQLiteDBConnection | null> {
         ALTER TABLE audit_checkpoints_new RENAME TO audit_checkpoints;
       `);
       await connection.execute("PRAGMA foreign_keys = ON;");
+    }
+
+    const checkpointColumns = await connection.query("PRAGMA table_info(audit_checkpoints)");
+    const existingCheckpointColumns = new Set((checkpointColumns.values ?? []).map((row) => String(row.name)));
+    if (!existingCheckpointColumns.has("photos_json")) {
+      await connection.execute("ALTER TABLE audit_checkpoints ADD COLUMN photos_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!existingCheckpointColumns.has("ofi_category")) {
+      await connection.execute("ALTER TABLE audit_checkpoints ADD COLUMN ofi_category TEXT NOT NULL DEFAULT ''");
     }
 
     // Heal any observations whose checkpoint_id was nulled by an earlier schema migration,
